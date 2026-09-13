@@ -193,21 +193,36 @@ if (process.argv.includes('--verdict')) {
     no('nothing named - call with the steps you intend to skip, e.g. `--verdict typecheck test`.');
   }
   const covered = new Set((m.steps || []).map((s) => String(s)));
-  // A multi-dir repo labels steps "<dir>: <name>" (achilles: "backend: test"),
-  // a single-dir one just "<name>". Compare on the bare name from BOTH sides so
-  // a caller can ask for `test` without knowing the repo's layout.
+  // A multi-dir repo labels steps "<dir>: <name>" (achilles: "backend: test:ci"),
+  // a single-dir one just "<name>", and extraSteps carry their label verbatim.
   //
-  // ⚠️ This means `test` is satisfied by a test step in ANY configured dir. That
-  // is sound only because the gate has no partial mode - a marker exists only
-  // after every step in every dir passed or was served from the pass cache for
-  // identical inputs, so "it ran tests somewhere" implies "it ran the tests it
-  // has". A dir with no test script contributes no step and has nothing to have
-  // skipped.
-  const bare = (s) => s.split(':').pop().trim();
-  const has = (want) => [...covered].some((s) => s === want || bare(s) === bare(want));
-  const missing = required.filter((r) => !has(r));
-  if (missing.length) {
-    no(`marker does not cover: ${missing.join(', ')} (it recorded: ${[...covered].join(', ') || 'nothing'}).`);
+  // 🔴 EXACT NAMES, and the package prefix when the repo has more than one dir.
+  // The first version compared "the text after the last colon" on both sides,
+  // which had two failures found on 2026-09-13: gitgood asked for `test` and the
+  // marker said `.: test:coverage` (reduced to `coverage`), so its test skip never
+  // fired and every deploy re-ran jest; and achilles' bare `test` was satisfied by
+  // `frontend-next: test` alone while the backend suite was `backend: test:ci`, so
+  // a backend deploy could skip its tests on the strength of the frontend's. A
+  // request must now name the step as the marker records it: `typecheck` in a
+  // single-dir repo, `backend: test:ci` in a multi-dir one. A bare name in a
+  // multi-dir repo is refused with the exact names to use.
+  const dirPrefixOf = (s) => {
+    const i = s.indexOf(': ');
+    return i !== -1 && dirs.includes(s.slice(0, i)) ? s.slice(0, i) : null;
+  };
+  const stripDir = (s) => { const p = dirPrefixOf(s); return p === null ? s : s.slice(p.length + 2); };
+  const problems = [];
+  for (const want of required) {
+    if (covered.has(want)) continue;
+    const candidates = [...covered].filter((s) => dirPrefixOf(s) !== null && stripDir(s) === want);
+    if (dirs.length > 1 && dirPrefixOf(want) === null && candidates.length) {
+      problems.push(`\`${want}\` is ambiguous in a repo with dirs [${dirs.join(', ')}] - ask for ${candidates.map((c) => `\`${c}\``).join(' and/or ')} instead`);
+    } else {
+      problems.push(`\`${want}\` is not a recorded step`);
+    }
+  }
+  if (problems.length) {
+    no(`marker does not cover the request: ${problems.join('; ')} (it recorded: ${[...covered].join(', ') || 'nothing'}).`);
   }
 
   say(`gate passed for ${head.slice(0, 8)} covering ${required.join(', ')} (clean tree, deps and gate unchanged).`);
@@ -670,6 +685,24 @@ if (uncovered.length) {
   console.log(`${C.d}           Add them to .ci-local.json "extraSteps" if they matter here.${C.n}`);
 }
 if (cachedSteps.length) console.log(`${C.d}[local-ci] ${cachedSteps.length} step(s) from the pass cache, ~${saved}s saved (LOCAL_CI_NO_CACHE=1 to re-run)${C.n}`);
+
+// The time budget (added 2026-09-13). Two shapes of slow step were found the
+// hard way: nobler-os's `coverage floors` took 589 s of a 631 s gate and could
+// never be cached because it declared no `inputs`; PGP's frontend coverage went
+// from ~80 s to 856 s after a dependency relock and nothing said a word. Both
+// are cheap to notice here and expensive to notice anywhere else.
+const UNCACHEABLE_SLOW_S = 30;
+const STEP_BUDGET_S = 300;
+const inputsOf = new Map(steps.map((s) => [s.label, s.inputs]));
+for (const [label, r] of results) {
+  if (r.state !== 'pass' && r.state !== 'warn') continue;
+  if (label === 'audit' || label.endsWith(': audit')) continue; // asks the advisory DB, never cacheable by design
+  if (!inputsOf.get(label) && r.seconds >= UNCACHEABLE_SLOW_S) {
+    console.log(`${C.y}[local-ci] ⚠  ${label} took ${r.seconds}s and can never be cached - give it "inputs" in .ci-local.json${C.n}`);
+  } else if (r.seconds >= STEP_BUDGET_S) {
+    console.log(`${C.y}[local-ci] ⚠  ${label} took ${r.seconds}s - over the ${STEP_BUDGET_S}s step budget; a step this slow usually just got slower (profile it)${C.n}`);
+  }
+}
 if (warned.length) console.log(`${C.y}[local-ci] warnings (not blocking): ${warned.join(', ')}${C.n}`);
 if (failed.length) {
   console.log(`${C.r}[local-ci] FAILED in ${total}s: ${failed.join(', ')}${C.n}`);
