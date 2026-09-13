@@ -63,7 +63,8 @@
  *   docsOnlyIgnore    regexes; a push touching only these skips the gate
  *   inputs            {"<dir>" | "<dir>:<key>": [paths]} - what a step READS.
  *                     Default is the whole repo. The step's own dir is always added.
- *   parallel          false to run every step serially (default true)
+ *   parallel          run package dirs side by side (default: only on a machine
+ *                     with 16 GB or more - see "run" below for why)
  *   minFreeMBPerStep  free memory needed to start a step beside another (default 2048)
  *
  * Bypass: `git push --no-verify`, or SKIP_LOCAL_CI=1.
@@ -73,7 +74,7 @@
 import { readFileSync, existsSync, writeFileSync, renameSync } from 'node:fs';
 import { spawnSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { freemem } from 'node:os';
+import { freemem, totalmem } from 'node:os';
 import { join, resolve, relative } from 'node:path';
 
 const ROOT = process.env.CI_LOCAL_ROOT || process.cwd();
@@ -100,7 +101,7 @@ const skip        = new Set(cfg.skip ?? []);
 const extraSteps  = cfg.extraSteps  ?? [];
 const ignoreGlobs = cfg.docsOnlyIgnore ?? ['^[^/]+\\.md$', '^docs/'];
 const inputsCfg   = cfg.inputs ?? {};
-const parallel    = cfg.parallel ?? true;
+const parallel    = cfg.parallel ?? (totalmem() >= 16 * 1024 ** 3);
 const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
 
 // The gate's own per-machine files. They are gitignored by install-local-ci.sh,
@@ -369,7 +370,8 @@ for (const s of extraSteps) {
   steps.push({
     label: s.label, cmd: 'bash', args: ['-c', s.cmd],
     cwd: resolve(ROOT, s.dir || '.'), mode: s.mode || 'block',
-    // One lane for all extra steps: they are hand-written and may assume order.
+    // One lane for all extra steps, run after the package lanes finish: they
+    // are hand-written, may assume order, and often read what a build wrote.
     lane: '(extra)',
     // Cached only when the manifest says what the command reads. `fleet parity`
     // reads sibling repos, so a tree hash of this one can never vouch for it.
@@ -470,16 +472,28 @@ function stepKey(s) {
 }
 
 // ── run ──────────────────────────────────────────────────────────────────────
-// Steps within a lane (one package dir, or all extraSteps) run in order, since
-// a build may lean on its typecheck. Lanes run side by side - but a step starts
-// beside another only when there is `minFreeMBPerStep` of free memory, and not
-// within a few seconds of the last start, so two suites do not both see the
-// same free memory and both claim it. On 2026-09-12 a push was killed by the
-// OOM killer while another session's Jest suite shared the machine; waiting is
-// slower than parallel and faster than starting over.
+// Steps within a lane (one package dir) run in order, since a build may lean on
+// its typecheck. Package lanes may run side by side - but a step starts beside
+// another only when there is `minFreeMBPerStep` of free memory, and not within
+// STAGGER_MS of the last start, so the first step's memory has had time to show
+// up before the second one reads the number.
+//
+// 🔴 extraSteps run AFTER every package lane, never beside them. The first cut of
+// this gate gave them a lane of their own, and on the first real rollout
+// (2026-09-13) that broke two repos: gohangout's `open-next build` read `.next/`
+// while the package's `next build` was still rewriting it (ENOENT on
+// prerender-manifest.json - a race reported as a FAIL), and lead-gen-strategist's
+// `tsc --noEmit` ran beside its `lint` for 53 minutes on a 7.8 GB machine. Extra
+// steps are hand-written and routinely consume what the package steps produce.
+//
+// 🔴 PARALLEL IS OFF BY DEFAULT BELOW 16 GB, for the second reason above: a
+// free-memory check at start cannot see what a TypeScript or ESLint process will
+// grow to a minute later, and two of them thrashing swap is far slower than
+// running them one after the other. A repo on a big machine gets it for free;
+// `"parallel": true` in .ci-local.json opts in anywhere.
 const TAIL_BYTES = 256 * 1024;
 const HEARTBEAT_MS = 30_000;
-const STAGGER_MS = 4_000;
+const STAGGER_MS = 20_000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const secs = (ms) => (ms / 1000).toFixed(0);
 
@@ -588,7 +602,9 @@ for (const s of steps) {
   if (!lanes.has(lane)) lanes.set(lane, []);
   lanes.get(lane).push(s);
 }
-console.log(`${C.d}           ${steps.length} steps in ${lanes.size} lane${lanes.size === 1 ? '' : 's'}${parallel ? '' : ' (parallel: false)'}${C.n}`);
+const packageLanes = [...lanes].filter(([k]) => k !== '(extra)').map(([, q]) => q);
+const extraLane = lanes.get('(extra)');
+console.log(`${C.d}           ${steps.length} steps, ${parallel ? `${packageLanes.length} package lane(s) side by side, extra steps after` : 'one at a time'}${C.n}`);
 console.log('');
 
 // A long silent step is indistinguishable from a hung one. Say what is running.
@@ -596,7 +612,8 @@ const heartbeat = setInterval(() => {
   const long = [...running].filter((r) => Date.now() - r.st >= 20_000);
   if (long.length) console.log(`${C.d}  … running: ${long.map((r) => `${r.label} ${secs(Date.now() - r.st)}s`).join(', ')}${C.n}`);
 }, HEARTBEAT_MS);
-await Promise.all([...lanes.values()].map(runLane));
+await Promise.all(packageLanes.map(runLane));
+if (extraLane) await runLane(extraLane);
 clearInterval(heartbeat);
 
 // Persist what passed, even when something else failed: a passing step's
