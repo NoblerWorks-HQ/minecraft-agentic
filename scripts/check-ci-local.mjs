@@ -22,11 +22,25 @@
  * last run - RUNS the gate. Being wrong about "Actions has this" means
  * shipping unchecked code; being wrong the other way costs four minutes.
  *
+ * IT REMEMBERS WHAT IT ALREADY PROVED (2026-09-13). On 2026-09-12 every CI run
+ * in all eleven repos had died on the Actions budget, so the stand-down above
+ * never fired, and a one-file Terraform merge into achilles re-ran all twelve
+ * steps - 517 seconds - against package trees byte-identical to ones that had
+ * passed hours earlier. Budget limits are expected to recur, so the gate can no
+ * longer lean on Actions for speed. Three changes:
+ *   - A PASS CACHE keyed by the git tree of each step's declared inputs (see
+ *     "the pass cache" below). Same inputs, same lockfiles, same gate, same
+ *     node: the step is skipped and says so.
+ *   - Packages run SIDE BY SIDE when there is memory for it, one step at a time
+ *     within a package.
+ *   - A heartbeat while a step runs, and per-step timings in the pass marker.
+ *
  * GENERATED FILE. Canonical source:
  *   ~/coding/engineering-standards/scripts/templates/check-ci-local.mjs
  * Re-stamp with `engineering-standards/scripts/install-local-ci.sh <repo>`.
  * Per-repo differences belong in `.ci-local.json`, NOT in edits here - eight
  * divergent copies of a gate is the failure the standards repo exists to stop.
+ * `check-fleet-parity.mjs` now fails when a copy differs from this file.
  *
  * WHAT IT RUNS. Auto-detected from each package.json: typecheck, lint, test
  * (test:ci / test:coverage / test, first match), build. Blocking, because those
@@ -35,17 +49,32 @@
  * earns a reflexive --no-verify.
  *
  * THE HONESTY RULE. This gate is a SUBSTITUTE for ci.yml, so the dangerous
- * failure is passing while silently covering less than CI did. Two guards:
+ * failure is passing while silently covering less than CI did. Guards:
  *   - Missing tooling is UNCHECKED and EXITS NONZERO, never a quiet pass.
+ *   - A step killed by a signal (the OOM killer) is UNCHECKED, never a FAIL.
  *   - Every run diffs its own steps against ci.yml's `run:` lines and prints
  *     what it does NOT cover. A green run that skipped half of CI must say so.
+ *   - A cached step prints "cached", with when and how long it took - never "pass".
+ *
+ * .ci-local.json keys:
+ *   dirs              package directories (default ["."])
+ *   skip              step keys to skip, bare ("test") or per dir ("backend:test")
+ *   extraSteps        [{label, cmd, dir?, mode?, inputs?}] - cached only with `inputs`
+ *   docsOnlyIgnore    regexes; a push touching only these skips the gate
+ *   inputs            {"<dir>" | "<dir>:<key>": [paths]} - what a step READS.
+ *                     Default is the whole repo. The step's own dir is always added.
+ *   parallel          false to run every step serially (default true)
+ *   minFreeMBPerStep  free memory needed to start a step beside another (default 2048)
  *
  * Bypass: `git push --no-verify`, or SKIP_LOCAL_CI=1.
  * Force the gate even when Actions is green: LOCAL_CI_FORCE=1.
+ * Ignore the pass cache for one run: LOCAL_CI_NO_CACHE=1.
  */
-import { readFileSync, existsSync } from 'node:fs';
-import { spawnSync } from 'node:child_process';
-import { join, resolve } from 'node:path';
+import { readFileSync, existsSync, writeFileSync, renameSync } from 'node:fs';
+import { spawnSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { freemem } from 'node:os';
+import { join, resolve, relative } from 'node:path';
 
 const ROOT = process.env.CI_LOCAL_ROOT || process.cwd();
 const C = process.stdout.isTTY
@@ -57,8 +86,12 @@ if (process.env.SKIP_LOCAL_CI === '1') {
   process.exit(0);
 }
 
+// argv: [range] [pushed sha]. The pre-push hook passes both; older hooks pass only the range.
 const range = process.argv[2] || '';
+const pushedSha = /^[0-9a-f]{40}$/.test(process.argv[3] || '') ? process.argv[3] : '';
 const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
+const git = (args) => spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
+const gitOut = (args) => (git(args).stdout || '').trim();
 
 /** Per-repo config. Absent is fine - the defaults cover a single-package repo. */
 const cfg = readJson(join(ROOT, '.ci-local.json')) || {};
@@ -66,11 +99,123 @@ const dirs        = cfg.dirs        ?? ['.'];
 const skip        = new Set(cfg.skip ?? []);
 const extraSteps  = cfg.extraSteps  ?? [];
 const ignoreGlobs = cfg.docsOnlyIgnore ?? ['^[^/]+\\.md$', '^docs/'];
+const inputsCfg   = cfg.inputs ?? {};
+const parallel    = cfg.parallel ?? true;
+const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
+
+// The gate's own per-machine files. They are gitignored by install-local-ci.sh,
+// but a repo stamped before that line existed would otherwise read as "dirty"
+// forever and never write a marker or use the cache.
+const OWN_FILES = new Set(['.local-ci-pass.json', '.local-ci-cache.json', '.local-ci-cache.json.tmp']);
+/** Uncommitted changes (tracked or untracked-not-ignored) under `paths`, minus the gate's own files. */
+function dirtyUnder(paths = []) {
+  const out = git(['status', '--porcelain', '--untracked-files=normal', '--', ...paths]).stdout || '';
+  return out.split('\n').filter(Boolean).filter((l) => !OWN_FILES.has(l.slice(3).trim()));
+}
+
+function hashOf(paths) {
+  const h = createHash('sha256');
+  let found = 0;
+  for (const p of paths.sort()) {
+    if (!existsSync(p)) continue;
+    found++;
+    h.update(p).update('\0');
+    try { h.update(readFileSync(p)); } catch { h.update('UNREADABLE'); }
+    h.update('\0');
+  }
+  // "no files found" must not hash the same as "files found and empty".
+  return found ? h.digest('hex').slice(0, 16) : null;
+}
+
+const LOCK_NAMES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb'];
+// The two hashes the pass marker pins. Defined once and used by BOTH the
+// writer (end of this file) and the --verdict reader below, so the check can
+// never drift from the thing it checks.
+const lockHash = () =>
+  hashOf(dirs.flatMap((d) => LOCK_NAMES.map((n) => join(ROOT, d, n))));
+const gateHash = () =>
+  hashOf([join(ROOT, 'scripts/check-ci-local.mjs'), join(ROOT, '.ci-local.json')]);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// --verdict: "did this gate already pass for exactly this code?" (2026-09-07)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Exit 0 = yes, provably; the caller may skip its own typecheck/test run.
+// Exit 1 = no, or cannot prove it; the caller MUST run its own checks.
+//
+// Deploy scripts call `scripts/ci-local-verdict.sh`, which is a thin shim over
+// this mode. It lives HERE, in the same file as `hashOf()`, on purpose: the
+// first cut re-implemented the hash in bash, and the two would have disagreed
+// on the first `dirs: ["."]` repo alone - node's join() normalises `a/./b` to
+// `a/b` and the shell does not. A verdict that always says "no" because of a
+// path-separator difference is a feature that silently does nothing, which is
+// worse than not shipping it.
+//
+// 🔴 FAIL-SAFE, exactly like the Actions skip above. Only a positive,
+// hash-matched marker answers yes. No marker, no git, an unreadable file, an
+// unknown version, any hash mismatch -> NO. Being wrong about "already tested"
+// ships unchecked code to production; being wrong the other way costs minutes.
+if (process.argv.includes('--verdict')) {
+  const quiet = process.env.CI_VERDICT_QUIET === '1';
+  const say = (m) => { if (!quiet) console.error(`[ci-verdict] ${m}`); };
+  const no = (m) => { say(m); say('-> running the checks.'); process.exit(1); };
+
+  if (process.env.TRUST_LOCAL_CI === '0') no('TRUST_LOCAL_CI=0 - refusing to reuse any marker.');
+
+  // The tree must be clean NOW, not merely at gate time: the marker describes a
+  // COMMIT, and an edit since then is untested code it cannot speak for.
+  if (dirtyUnder().length) no('working tree is dirty - the marker describes a commit, not these edits.');
+  const head = gitOut(['rev-parse', 'HEAD']);
+  if (!head) no('cannot resolve HEAD.');
+
+  const m = readJson(join(ROOT, '.local-ci-pass.json'));
+  if (!m) no('no pass marker (this gate has not passed here for a clean tree).');
+  if (m.v !== 1) no(`marker version ${JSON.stringify(m.v)} is not one this script understands.`);
+  if (m.sha !== head) no(`marker is for ${String(m.sha).slice(0, 8)}, HEAD is ${head.slice(0, 8)}.`);
+  if (m.lock !== lockHash()) no('dependencies changed since the gate ran.');
+  if (m.gate !== gateHash()) no('the gate itself changed since the marker was written.');
+
+  // 🔴 THE COVERAGE CHECK, and it is the whole reason this is safe to use.
+  //
+  // A marker says the gate passed - NOT that the gate ran everything. semantix
+  // carries `"skip": ["test"]` because its suites need DynamoDB Local, which a
+  // workstation does not have, so its marker legitimately reads
+  // ["audit","lint","typecheck"]. A deploy that skipped its TEST run on the
+  // strength of that marker would be skipping tests THAT NEVER RAN - a green
+  // checkmark over a step that did not execute, which is the exact failure this
+  // fleet keeps being bitten by.
+  //
+  // So the caller must NAME what it intends to skip, and gets "yes" only if the
+  // marker actually covers it. No arguments means no claim, and therefore no.
+  const required = process.argv.slice(process.argv.indexOf('--verdict') + 1).filter((a) => !a.startsWith('-'));
+  if (!required.length) {
+    no('nothing named - call with the steps you intend to skip, e.g. `--verdict typecheck test`.');
+  }
+  const covered = new Set((m.steps || []).map((s) => String(s)));
+  // A multi-dir repo labels steps "<dir>: <name>" (achilles: "backend: test"),
+  // a single-dir one just "<name>". Compare on the bare name from BOTH sides so
+  // a caller can ask for `test` without knowing the repo's layout.
+  //
+  // ⚠️ This means `test` is satisfied by a test step in ANY configured dir. That
+  // is sound only because the gate has no partial mode - a marker exists only
+  // after every step in every dir passed or was served from the pass cache for
+  // identical inputs, so "it ran tests somewhere" implies "it ran the tests it
+  // has". A dir with no test script contributes no step and has nothing to have
+  // skipped.
+  const bare = (s) => s.split(':').pop().trim();
+  const has = (want) => [...covered].some((s) => s === want || bare(s) === bare(want));
+  const missing = required.filter((r) => !has(r));
+  if (missing.length) {
+    no(`marker does not cover: ${missing.join(', ')} (it recorded: ${[...covered].join(', ') || 'nothing'}).`);
+  }
+
+  say(`gate passed for ${head.slice(0, 8)} covering ${required.join(', ')} (clean tree, deps and gate unchanged).`);
+  process.exit(0);
+}
 
 // ── docs-only skip ───────────────────────────────────────────────────────────
 if (range) {
-  const diff = spawnSync('git', ['diff', '--name-only', range], { cwd: ROOT, encoding: 'utf8' });
-  const files = (diff.stdout || '').split('\n').filter(Boolean);
+  const files = gitOut(['diff', '--name-only', range]).split('\n').filter(Boolean);
   if (files.length) {
     const res = ignoreGlobs.map((g) => new RegExp(g));
     if (files.every((f) => res.some((re) => re.test(f)))) {
@@ -152,7 +297,6 @@ if (runReason === null) {
 
 console.log(`${C.c}[local-ci] Actions not confirmed green (${runReason}). Running the gate here.${C.n}`);
 if (range) console.log(`${C.d}           range: ${range}${C.n}`);
-console.log('');
 
 // ── plan ─────────────────────────────────────────────────────────────────────
 // Which scripts does ci.yml actually invoke? PREFER THOSE over our default
@@ -208,19 +352,28 @@ for (const d of dirs) {
     // No ci.yml at all => nothing to mirror, so fall back to everything found.
     const hit = names.find((n) => scripts[n] && ciScripts.has(n))
       ?? (ciScripts.size ? null : names.find((n) => scripts[n]));
-    if (hit) steps.push({ label: label(hit), cmd: pm, args: ['run', hit], cwd: abs, mode });
+    if (hit) {
+      const inputs = inputsCfg[`${d}:${key}`] ?? inputsCfg[d] ?? ['.'];
+      steps.push({ label: label(hit), cmd: pm, args: ['run', hit], cwd: abs, mode, lane: d, inputs: [d, ...inputs] });
+    }
   }
   if (!skip.has('audit')) {
     const args = pm === 'pnpm'
       ? ['audit', '--audit-level=high', '--prod']
       : ['audit', '--omit=dev', '--audit-level=high'];
-    steps.push({ label: label('audit'), cmd: pm, args, cwd: abs, mode: 'warn' });
+    // Never cached: audit answers a question about the advisory database, not the tree.
+    steps.push({ label: label('audit'), cmd: pm, args, cwd: abs, mode: 'warn', lane: d, inputs: null });
   }
 }
 for (const s of extraSteps) {
   steps.push({
     label: s.label, cmd: 'bash', args: ['-c', s.cmd],
     cwd: resolve(ROOT, s.dir || '.'), mode: s.mode || 'block',
+    // One lane for all extra steps: they are hand-written and may assume order.
+    lane: '(extra)',
+    // Cached only when the manifest says what the command reads. `fleet parity`
+    // reads sibling repos, so a tree hash of this one can never vouch for it.
+    inputs: Array.isArray(s.inputs) ? [s.dir || '.', ...s.inputs] : null,
   });
 }
 
@@ -236,44 +389,229 @@ if (!steps.length) {
   process.exit(1);
 }
 
-// ── run ──────────────────────────────────────────────────────────────────────
-const failed = [], warned = [], t0 = Date.now();
+// ─────────────────────────────────────────────────────────────────────────────
+// The pass cache (added 2026-09-13)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// A step's result is a function of what it reads. So each passing step is
+// recorded under a key built from:
+//   - the git TREE ID of every path in its inputs, at HEAD
+//   - the lockfiles, this gate + .ci-local.json, the node version
+//   - the step's label, command and directory
+// and a later run whose key matches is skipped. A commit that changes nothing
+// a step reads - a merge of an unrelated package, a rebase, a message amend, a
+// re-push after the OOM killer took the last attempt - costs nothing.
+//
+// 🔴 INPUTS DEFAULT TO THE WHOLE REPO, and narrowing them is a claim. Tests in
+// this fleet read across package lines as a matter of course: achilles'
+// frontend drift tests parse backend/ and terraform/, its backend tests read
+// terraform/ and lambda-cognito-auth/, and Content2Clients' backend API setup
+// reads frontend/. A per-package default would have served a stale pass for
+// every one of them. So the default only reuses a pass when the WHOLE tree is
+// identical, and `.ci-local.json` "inputs" narrows it per dir or per step. A
+// wrong narrowing is a false pass, so write the evidence beside it.
+//
+// 🔴 FAIL-SAFE. No key - an input with uncommitted changes, an input path that
+// does not exist at HEAD, no HEAD, a push of a commit that is not the checkout,
+// LOCAL_CI_NO_CACHE=1 - means the step runs. Only a matching key skips.
+//
+// ⚠️ NO TTL, on purpose, for the reason the marker below has none: identical
+// inputs give identical results. The exception is a test that reads the clock
+// or the network; that is a flaky test, and LOCAL_CI_NO_CACHE=1 is the escape.
+//
+// ⚠️ Ignored files are not inputs. A test that reads a gitignored `.env` is
+// keyed as if the file did not exist - the same blind spot the marker has.
+
+const CACHE_FILE = join(ROOT, '.local-ci-cache.json');
+const CACHE_V = 1;
+const CACHE_KEEP = 400;
+const head = gitOut(['rev-parse', 'HEAD']);
+const cacheOff =
+  process.env.LOCAL_CI_NO_CACHE === '1' ? 'LOCAL_CI_NO_CACHE=1'
+  : !head ? 'no HEAD'
+  : pushedSha && pushedSha !== head ? `the pushed commit ${pushedSha.slice(0, 8)} is not the checkout (${head.slice(0, 8)})`
+  : null;
+if (pushedSha && head && pushedSha !== head) {
+  console.log(`${C.y}[local-ci] ⚠  pushing ${pushedSha.slice(0, 8)}, but the checkout is ${head.slice(0, 8)} - the gate tests the checkout.${C.n}`);
+}
+const cacheDoc = cacheOff ? null : readJson(CACHE_FILE);
+const cache = cacheDoc?.v === CACHE_V && cacheDoc.entries && typeof cacheDoc.entries === 'object' ? cacheDoc.entries : {};
+if (cacheOff) console.log(`${C.d}           pass cache off: ${cacheOff}${C.n}`);
+
+// Input paths are validated before anything runs: a typo'd path in .ci-local.json
+// would hash as "absent" forever and quietly narrow what the key covers.
+const badInputs = new Set();
 for (const s of steps) {
-  const st = Date.now();
-  process.stdout.write(`  ${s.label.padEnd(30)}`);
-  // maxBuffer is NOT optional. Node's default is 1 MiB, and it does not truncate -
-  // it KILLS the child. nobler-os's `pnpm test` emits 1,096,663 bytes and passes;
-  // at the default it was killed at ~1 MiB and reported FAIL, a false red on a
-  // green suite. A gate that fails a passing build gets bypassed on day one, so
-  // this is the difference between a gate and a nuisance.
-  const r = spawnSync(s.cmd, s.args, {
-    cwd: s.cwd, encoding: 'utf8', shell: process.platform === 'win32',
-    maxBuffer: 256 * 1024 * 1024,
-    // No TTY and no stdin: a step that wants to prompt must fail, not wait.
-    // `next lint` on an unconfigured repo asks "How would you like to configure
-    // ESLint?" and rendered an arrow-key menu into the captured output.
-    stdio: ['ignore', 'pipe', 'pipe'],
+  if (!s.inputs) continue;
+  s.inputs = [...new Set(s.inputs.map((p) => String(p).replace(/^\.\/+/, '').replace(/\/+$/, '') || '.'))].sort();
+  for (const p of s.inputs) {
+    if (p !== '.' && head && git(['cat-file', '-e', `HEAD:${p}`]).status !== 0) badInputs.add(p);
+  }
+}
+if (badInputs.size) {
+  console.log(`${C.r}[local-ci] UNCHECKED: .ci-local.json "inputs" names paths that do not exist at HEAD: ${[...badInputs].join(', ')}${C.n}`);
+  console.log(`${C.y}           Fix the manifest - a wrong input silently narrows what a cached pass vouches for.${C.n}`);
+  process.exit(1);
+}
+
+const lockNow = lockHash();
+const gateNow = gateHash();
+/** The cache key for a step, or {key:null, why} when it must run. */
+function stepKey(s) {
+  if (cacheOff) return { key: null, why: cacheOff };
+  if (!s.inputs) return { key: null, why: 'not cacheable' };
+  if (dirtyUnder(s.inputs).length) return { key: null, why: 'uncommitted changes in its inputs' };
+  const h = createHash('sha256').update([
+    `v${CACHE_V}`, s.label, `${s.cmd} ${s.args.join(' ')}`, relative(ROOT, s.cwd) || '.',
+    process.version, lockNow ?? 'nolock', gateNow ?? 'nogate',
+  ].join('\0'));
+  for (const p of s.inputs) h.update(`\0${p}=${gitOut(['rev-parse', `HEAD:${p === '.' ? '' : p}`])}`);
+  return { key: h.digest('hex').slice(0, 32) };
+}
+
+// ── run ──────────────────────────────────────────────────────────────────────
+// Steps within a lane (one package dir, or all extraSteps) run in order, since
+// a build may lean on its typecheck. Lanes run side by side - but a step starts
+// beside another only when there is `minFreeMBPerStep` of free memory, and not
+// within a few seconds of the last start, so two suites do not both see the
+// same free memory and both claim it. On 2026-09-12 a push was killed by the
+// OOM killer while another session's Jest suite shared the machine; waiting is
+// slower than parallel and faster than starting over.
+const TAIL_BYTES = 256 * 1024;
+const HEARTBEAT_MS = 30_000;
+const STAGGER_MS = 4_000;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const secs = (ms) => (ms / 1000).toFixed(0);
+
+const results = new Map(); // label -> { state: pass|warn|fail|unchecked|cached, seconds, at? }
+const failed = [], warned = [];
+const running = new Set();
+let lastStart = 0;
+const t0 = Date.now();
+
+function printResult(label, text) {
+  console.log(`  ${label.padEnd(30)}${text}`);
+}
+
+async function memoryTurn() {
+  for (let waitedMs = 0; ; waitedMs += 2000) {
+    if (running.size === 0) return;
+    const freeMB = freemem() / 1048576;
+    if (freeMB >= minFreeMB && Date.now() - lastStart >= STAGGER_MS) return;
+    if (waitedMs === 10_000) {
+      console.log(`${C.d}  … waiting for memory to start the next step (${freeMB.toFixed(0)} MB free, need ${minFreeMB})${C.n}`);
+    }
+    await sleep(2000);
+  }
+}
+
+function runStep(s, key) {
+  return new Promise((done) => {
+    const st = Date.now();
+    const entry = { label: s.label, st };
+    running.add(entry);
+    lastStart = st;
+    let tail = '';
+    const keep = (buf) => { tail = (tail + buf.toString('utf8')).slice(-TAIL_BYTES); };
+    let finished = false;
+    // Output is kept as a rolling tail rather than a buffer that kills the child
+    // at a limit. nobler-os's `pnpm test` emits over 1 MiB and passes; the old
+    // spawnSync maxBuffer had to be raised to 256 MiB to stop a false red.
+    const child = spawn(s.cmd, s.args, {
+      cwd: s.cwd, shell: process.platform === 'win32',
+      // No TTY and no stdin: a step that wants to prompt must fail, not wait.
+      // `next lint` on an unconfigured repo asks "How would you like to configure
+      // ESLint?" and rendered an arrow-key menu into the captured output.
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout.on('data', keep);
+    child.stderr.on('data', keep);
+    const finish = (code, err, signal) => {
+      if (finished) return;
+      finished = true;
+      running.delete(entry);
+      const ms = Date.now() - st;
+      const dt = secs(ms);
+      if (err && err.code === 'ENOENT') {
+        printResult(s.label, `${C.r}UNCHECKED${C.n} ${C.d}(${s.cmd} not found)${C.n}`);
+        failed.push(`${s.label} (tooling missing)`);
+        results.set(s.label, { state: 'unchecked', seconds: +dt });
+      } else if (signal) {
+        // A signal is not a verdict about the code. SIGKILL here is almost always
+        // the OOM killer - reporting it as FAIL sends someone hunting a bug.
+        printResult(s.label, `${C.r}UNCHECKED${C.n} ${C.d}(killed by ${signal} after ${dt}s - out of memory? not a code failure)${C.n}`);
+        failed.push(`${s.label} (killed by ${signal}, not a code failure)`);
+        results.set(s.label, { state: 'unchecked', seconds: +dt });
+      } else if (code !== 0 && /\b(?:sh|bash|env|zsh): .*(?:command )?not found/.test(tail)) {
+        printResult(s.label, `${C.r}UNCHECKED${C.n} ${C.d}(tool missing - stale install? run the repo's install)${C.n}`);
+        failed.push(`${s.label} (tool missing, not a code failure)`);
+        results.set(s.label, { state: 'unchecked', seconds: +dt });
+      } else if (code === 0) {
+        printResult(s.label, `${C.g}pass${C.n} ${C.d}(${dt}s)${C.n}`);
+        results.set(s.label, { state: 'pass', seconds: +dt });
+        if (key) cache[key] = { label: s.label, at: new Date().toISOString(), seconds: +dt, sha: head };
+      } else if (s.mode === 'warn') {
+        printResult(s.label, `${C.y}warn${C.n} ${C.d}(${dt}s)${C.n}`);
+        warned.push(s.label);
+        results.set(s.label, { state: 'warn', seconds: +dt });
+      } else {
+        printResult(s.label, `${C.r}FAIL${C.n} ${C.d}(${dt}s)${C.n}`);
+        failed.push(s.label);
+        results.set(s.label, { state: 'fail', seconds: +dt });
+        console.log(tail.trimEnd().split('\n').slice(-25).map((l) => `      ${l}`).join('\n'));
+      }
+      done();
+    };
+    child.on('error', (err) => finish(null, err, null));
+    child.on('close', (code, signal) => finish(code, null, signal));
   });
-  const dt = ((Date.now() - st) / 1000).toFixed(0);
-  const out = `${r.stdout || ''}${r.stderr || ''}`;
-  if (r.error && r.error.code === 'ENOBUFS') {
-    console.log(`${C.r}UNCHECKED${C.n} ${C.d}(output exceeded maxBuffer - we killed it, it did not fail)${C.n}`);
-    failed.push(`${s.label} (output overflow)`);
-  } else if (r.error && r.error.code === 'ENOENT') {
-    console.log(`${C.r}UNCHECKED${C.n} ${C.d}(${s.cmd} not found)${C.n}`);
-    failed.push(`${s.label} (tooling missing)`);
-  } else if (r.status !== 0 && /\b(?:sh|bash|env|zsh): .*(?:command )?not found/.test(out)) {
-    console.log(`${C.r}UNCHECKED${C.n} ${C.d}(tool missing - stale install? run the repo's install)${C.n}`);
-    failed.push(`${s.label} (tool missing, not a code failure)`);
-  } else if (r.status === 0) {
-    console.log(`${C.g}pass${C.n} ${C.d}(${dt}s)${C.n}`);
-  } else if (s.mode === 'warn') {
-    console.log(`${C.y}warn${C.n} ${C.d}(${dt}s)${C.n}`);
-    warned.push(s.label);
-  } else {
-    console.log(`${C.r}FAIL${C.n} ${C.d}(${dt}s)${C.n}`);
-    failed.push(s.label);
-    console.log(out.trimEnd().split('\n').slice(-25).map((l) => `      ${l}`).join('\n'));
+}
+
+async function runLane(queue) {
+  for (const s of queue) {
+    const { key } = stepKey(s);
+    const hit = key && cache[key];
+    if (hit) {
+      const when = String(hit.at || '').slice(0, 16).replace('T', ' ');
+      printResult(s.label, `${C.c}cached${C.n} ${C.d}(passed ${when} UTC on identical inputs, took ${hit.seconds}s)${C.n}`);
+      results.set(s.label, { state: 'cached', seconds: 0, saved: hit.seconds });
+      continue;
+    }
+    await memoryTurn();
+    await runStep(s, key);
+  }
+}
+
+const lanes = new Map();
+for (const s of steps) {
+  const lane = parallel ? s.lane : 'serial';
+  if (!lanes.has(lane)) lanes.set(lane, []);
+  lanes.get(lane).push(s);
+}
+console.log(`${C.d}           ${steps.length} steps in ${lanes.size} lane${lanes.size === 1 ? '' : 's'}${parallel ? '' : ' (parallel: false)'}${C.n}`);
+console.log('');
+
+// A long silent step is indistinguishable from a hung one. Say what is running.
+const heartbeat = setInterval(() => {
+  const long = [...running].filter((r) => Date.now() - r.st >= 20_000);
+  if (long.length) console.log(`${C.d}  … running: ${long.map((r) => `${r.label} ${secs(Date.now() - r.st)}s`).join(', ')}${C.n}`);
+}, HEARTBEAT_MS);
+await Promise.all([...lanes.values()].map(runLane));
+clearInterval(heartbeat);
+
+// Persist what passed, even when something else failed: a passing step's
+// result is still true for its inputs, and the fix-and-re-push loop is exactly
+// when re-running it hurts most.
+if (!cacheOff) {
+  try {
+    const entries = Object.entries(cache)
+      .sort(([, a], [, b]) => String(b.at).localeCompare(String(a.at)))
+      .slice(0, CACHE_KEEP);
+    const tmp = `${CACHE_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ v: CACHE_V, entries: Object.fromEntries(entries) }, null, 1) + '\n');
+    renameSync(tmp, CACHE_FILE);
+  } catch {
+    // Never fail a gate over bookkeeping; a missing cache only costs time.
   }
 }
 
@@ -305,13 +643,16 @@ if (existsSync(ciPath)) {
   }
 }
 
-const total = ((Date.now() - t0) / 1000).toFixed(0);
+const total = secs(Date.now() - t0);
+const cachedSteps = [...results.values()].filter((r) => r.state === 'cached');
+const saved = cachedSteps.reduce((n, r) => n + (r.saved || 0), 0);
 console.log('');
 if (uncovered.length) {
   console.log(`${C.y}[local-ci] NOT covered locally (ci.yml runs these, this gate does not):${C.n}`);
   for (const u of uncovered) console.log(`${C.y}           - ${u}${C.n}`);
   console.log(`${C.d}           Add them to .ci-local.json "extraSteps" if they matter here.${C.n}`);
 }
+if (cachedSteps.length) console.log(`${C.d}[local-ci] ${cachedSteps.length} step(s) from the pass cache, ~${saved}s saved (LOCAL_CI_NO_CACHE=1 to re-run)${C.n}`);
 if (warned.length) console.log(`${C.y}[local-ci] warnings (not blocking): ${warned.join(', ')}${C.n}`);
 if (failed.length) {
   console.log(`${C.r}[local-ci] FAILED in ${total}s: ${failed.join(', ')}${C.n}`);
@@ -319,3 +660,69 @@ if (failed.length) {
   process.exit(1);
 }
 console.log(`${C.g}[local-ci] gate passed in ${total}s${C.n}`);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The pass marker: stop paying for this twice (added 2026-09-07)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHY. This gate runs at `git push`, and then `deploy.sh` preflight runs the
+// SAME typecheck and the SAME suite minutes later. Measured on 2026-09-07
+// shipping one change: achilles paid 155s here and ~360s again in preflight -
+// 8.5 minutes of testing to ship once. gitgood paid 141s + ~185s. Both repos
+// already have a TRUST_CI shortcut that would skip preflight, and it can never
+// fire while GitHub Actions is billing-blocked, which it has been since
+// 2026-09-04.
+//
+// So record what passed, and let the deploy read it. `ci-local-verdict.sh` is
+// the ONE reader - deploy scripts call that rather than re-implementing this
+// check four times, which is the second-copy failure the standards repo exists
+// to stop.
+//
+// 🔴 THE MARKER IS PINNED TO THREE HASHES, NOT A TIMESTAMP. A TTL would be
+// theatre: an hour-old marker on identical inputs is exactly as good as a
+// fresh one, and a fresh marker on changed inputs is worthless. What actually
+// invalidates a result is the inputs changing, so that is what is recorded:
+//   - sha   the commit the gate ran against
+//   - lock  the lockfiles, so a dependency change re-runs
+//   - gate  this script + .ci-local.json, so CHANGING THE GATE re-runs
+// The third is the one that is easy to forget and the most dangerous to omit:
+// without it, widening the gate would be silently skipped by a marker written
+// under the old, narrower definition.
+//
+// A step served from the pass cache counts as covered: it passed on the same
+// inputs, which is the same claim a marker makes about a commit.
+//
+// 🔴 NO MARKER IS WRITTEN FROM A DIRTY TREE. A result cannot be attributed to
+// a commit that does not describe what was tested. `--no-verify` writes nothing
+// either, because this code never runs then - which is correct: a bypassed gate
+// must not license a skipped preflight.
+
+try {
+  if (dirtyUnder().length) {
+    console.log(`${C.d}[local-ci] working tree dirty - no pass marker written (deploy will re-run its own gate)${C.n}`);
+  } else if (!head) {
+    console.log(`${C.d}[local-ci] no HEAD - no pass marker written${C.n}`);
+  } else {
+    const marker = {
+      v: 1,
+      sha: head,
+      // The SAME two functions --verdict reads with. One implementation, so the
+      // writer and the reader cannot drift apart.
+      lock: lockHash(),
+      gate: gateHash(),
+      steps: steps.map((s) => String(s.label ?? '')).filter(Boolean).sort(),
+      // Recorded for a human reading the file, never compared - see the note
+      // above on why a TTL would be theatre. `timings` is seconds actually
+      // spent this run; a cached step reads 0 and is listed in `cached`.
+      at: new Date().toISOString(),
+      seconds: +total,
+      timings: Object.fromEntries([...results].map(([l, r]) => [l, r.seconds])),
+      cached: [...results].filter(([, r]) => r.state === 'cached').map(([l]) => l).sort(),
+    };
+    writeFileSync(join(ROOT, '.local-ci-pass.json'), JSON.stringify(marker, null, 2) + '\n');
+    console.log(`${C.d}[local-ci] pass marker written for ${head.slice(0, 8)} - deploy preflight may reuse it${C.n}`);
+  }
+} catch {
+  // Never fail a passing gate over bookkeeping. No marker just means the
+  // deploy re-runs its own checks, which is the pre-2026-09-07 behaviour.
+}

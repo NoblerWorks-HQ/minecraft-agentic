@@ -14,8 +14,10 @@ ROOT="$(git rev-parse --show-toplevel)"
 Z="0000000000000000000000000000000000000000"
 
 range=""
+pushed=""
 while read -r _lref lsha _rref rsha; do
     [ "$lsha" = "$Z" ] && continue                 # branch deletion, nothing to check
+    pushed="$lsha"
     [ "$rsha" = "$Z" ] || range="${rsha}..${lsha}" # new branch => empty => check everything
     break
 done
@@ -23,4 +25,6 @@ done
 command -v node >/dev/null 2>&1 || {
     echo "[local-ci] UNCHECKED: node not on PATH - refusing to report a pass." >&2; exit 1; }
 
-exec node "$ROOT/scripts/check-ci-local.mjs" "$range"
+# The pushed sha lets the gate refuse its pass cache when the commit being
+# pushed is not the checkout it is about to test.
+exec node "$ROOT/scripts/check-ci-local.mjs" "$range" "$pushed"
