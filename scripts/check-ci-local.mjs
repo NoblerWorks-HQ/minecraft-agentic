@@ -66,6 +66,11 @@
  *   parallel          run package dirs side by side (default: only on a machine
  *                     with 16 GB or more - see "run" below for why)
  *   minFreeMBPerStep  free memory needed to start a step beside another (default 2048)
+ *   jestWorkers       workers for a `jest --runInBand` test script run BY THIS GATE
+ *                     (default 2 on a machine with 7 GB or more, else 1). The
+ *                     script itself is untouched - CI and deploys still run it
+ *                     serially. 1 opts a repo out (a suite with a fixed port or a
+ *                     shared container). See "two workers" below.
  *
  * Bypass: `git push --no-verify`, or SKIP_LOCAL_CI=1.
  * Force the gate even when Actions is green: LOCAL_CI_FORCE=1.
@@ -103,6 +108,11 @@ const ignoreGlobs = cfg.docsOnlyIgnore ?? ['^[^/]+\\.md$', '^docs/'];
 const inputsCfg   = cfg.inputs ?? {};
 const parallel    = cfg.parallel ?? (totalmem() >= 16 * 1024 ** 3);
 const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
+const jestWorkers = cfg.jestWorkers ?? (totalmem() >= 7 * 1024 ** 3 ? 2 : 1);
+// Free memory a multi-worker jest run needs at the moment it starts; below this
+// the step runs the script as written (serial) rather than wait. Measured peaks
+// with two workers + workerIdleMemoryLimit=1GB: 1.5-2.6 GB (2026-09-13).
+const JEST_WORKERS_MIN_FREE_MB = 3072;
 
 // The gate's own per-machine files. They are gitignored by install-local-ci.sh,
 // but a repo stamped before that line existed would otherwise read as "dirty"
@@ -193,21 +203,36 @@ if (process.argv.includes('--verdict')) {
     no('nothing named - call with the steps you intend to skip, e.g. `--verdict typecheck test`.');
   }
   const covered = new Set((m.steps || []).map((s) => String(s)));
-  // A multi-dir repo labels steps "<dir>: <name>" (achilles: "backend: test"),
-  // a single-dir one just "<name>". Compare on the bare name from BOTH sides so
-  // a caller can ask for `test` without knowing the repo's layout.
+  // A multi-dir repo labels steps "<dir>: <name>" (achilles: "backend: test:ci"),
+  // a single-dir one just "<name>", and extraSteps carry their label verbatim.
   //
-  // ⚠️ This means `test` is satisfied by a test step in ANY configured dir. That
-  // is sound only because the gate has no partial mode - a marker exists only
-  // after every step in every dir passed or was served from the pass cache for
-  // identical inputs, so "it ran tests somewhere" implies "it ran the tests it
-  // has". A dir with no test script contributes no step and has nothing to have
-  // skipped.
-  const bare = (s) => s.split(':').pop().trim();
-  const has = (want) => [...covered].some((s) => s === want || bare(s) === bare(want));
-  const missing = required.filter((r) => !has(r));
-  if (missing.length) {
-    no(`marker does not cover: ${missing.join(', ')} (it recorded: ${[...covered].join(', ') || 'nothing'}).`);
+  // 🔴 EXACT NAMES, and the package prefix when the repo has more than one dir.
+  // The first version compared "the text after the last colon" on both sides,
+  // which had two failures found on 2026-09-13: gitgood asked for `test` and the
+  // marker said `.: test:coverage` (reduced to `coverage`), so its test skip never
+  // fired and every deploy re-ran jest; and achilles' bare `test` was satisfied by
+  // `frontend-next: test` alone while the backend suite was `backend: test:ci`, so
+  // a backend deploy could skip its tests on the strength of the frontend's. A
+  // request must now name the step as the marker records it: `typecheck` in a
+  // single-dir repo, `backend: test:ci` in a multi-dir one. A bare name in a
+  // multi-dir repo is refused with the exact names to use.
+  const dirPrefixOf = (s) => {
+    const i = s.indexOf(': ');
+    return i !== -1 && dirs.includes(s.slice(0, i)) ? s.slice(0, i) : null;
+  };
+  const stripDir = (s) => { const p = dirPrefixOf(s); return p === null ? s : s.slice(p.length + 2); };
+  const problems = [];
+  for (const want of required) {
+    if (covered.has(want)) continue;
+    const candidates = [...covered].filter((s) => dirPrefixOf(s) !== null && stripDir(s) === want);
+    if (dirs.length > 1 && dirPrefixOf(want) === null && candidates.length) {
+      problems.push(`\`${want}\` is ambiguous in a repo with dirs [${dirs.join(', ')}] - ask for ${candidates.map((c) => `\`${c}\``).join(' and/or ')} instead`);
+    } else {
+      problems.push(`\`${want}\` is not a recorded step`);
+    }
+  }
+  if (problems.length) {
+    no(`marker does not cover the request: ${problems.join('; ')} (it recorded: ${[...covered].join(', ') || 'nothing'}).`);
   }
 
   say(`gate passed for ${head.slice(0, 8)} covering ${required.join(', ')} (clean tree, deps and gate unchanged).`);
@@ -355,7 +380,35 @@ for (const d of dirs) {
       ?? (ciScripts.size ? null : names.find((n) => scripts[n]));
     if (hit) {
       const inputs = inputsCfg[`${d}:${key}`] ?? inputsCfg[d] ?? ['.'];
-      steps.push({ label: label(hit), cmd: pm, args: ['run', hit], cwd: abs, mode, lane: d, inputs: [d, ...inputs] });
+      const step = { label: label(hit), cmd: pm, args: ['run', hit], cwd: abs, mode, lane: d, inputs: [d, ...inputs] };
+      // ── two workers (2026-09-13) ─────────────────────────────────────────
+      // Rule 1 keeps `--runInBand` in every test SCRIPT: CI and deploys run it
+      // serially and nothing there changes. This gate runs at every push, on a
+      // machine that is otherwise waiting, so it may spend memory to save time:
+      // measured A/B on the three largest suites (C2C backend, achilles backend,
+      // gitgood root), two workers with workerIdleMemoryLimit=1GB were 37-53 %
+      // faster, identical tests and coverage, peak RSS 1.5-2.6 GB. Only a script
+      // that is literally `[ENV=x ...] jest <flags>` is rewritten; anything else
+      // (turbo, vitest, a chain) runs as written. `--runInBand` must be REMOVED
+      // rather than overridden: jest lets it win over --maxWorkers.
+      const m = key === 'test' && jestWorkers > 1 && typeof scripts[hit] === 'string'
+        ? scripts[hit].match(/^((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)jest(\s.*)?$/) : null;
+      const bin = join(abs, 'node_modules', '.bin', 'jest');
+      if (m && /(^|\s)--runInBand(\s|$)/.test(m[2] || '') && existsSync(bin)) {
+        const env = {};
+        for (const kv of (m[1] || '').trim().split(/\s+/).filter(Boolean)) {
+          const i = kv.indexOf('='); env[kv.slice(0, i)] = kv.slice(i + 1);
+        }
+        const flags = (m[2] || '').trim().split(/\s+/).filter((f) => f && f !== '--runInBand');
+        step.serial = { cmd: step.cmd, args: step.args };
+        step.workers = jestWorkers;
+        step.env = env;
+        // Relative to the step's cwd, so the pass-cache key (which includes the
+        // command) is the same in every clone of the repo.
+        step.cmd = join('node_modules', '.bin', 'jest');
+        step.args = [...flags, `--maxWorkers=${jestWorkers}`, '--workerIdleMemoryLimit=1GB'];
+      }
+      steps.push(step);
     }
   }
   if (!skip.has('audit')) {
@@ -528,11 +581,21 @@ function runStep(s, key) {
     let tail = '';
     const keep = (buf) => { tail = (tail + buf.toString('utf8')).slice(-TAIL_BYTES); };
     let finished = false;
+    // A multi-worker jest step falls back to the script as written when memory
+    // is short right now - serial is slower, thrashing swap is slower still.
+    let { cmd, args } = s;
+    let how = '';
+    if (s.workers) {
+      const freeMB = freemem() / 1048576;
+      if (freeMB >= JEST_WORKERS_MIN_FREE_MB) how = `${s.workers} workers`;
+      else { ({ cmd, args } = s.serial); how = `serial: ${freeMB.toFixed(0)} MB free, ${s.workers} workers need ${JEST_WORKERS_MIN_FREE_MB}`; }
+    }
     // Output is kept as a rolling tail rather than a buffer that kills the child
     // at a limit. nobler-os's `pnpm test` emits over 1 MiB and passes; the old
     // spawnSync maxBuffer had to be raised to 256 MiB to stop a false red.
-    const child = spawn(s.cmd, s.args, {
+    const child = spawn(cmd, args, {
       cwd: s.cwd, shell: process.platform === 'win32',
+      env: s.env ? { ...process.env, ...s.env } : process.env,
       // No TTY and no stdin: a step that wants to prompt must fail, not wait.
       // `next lint` on an unconfigured repo asks "How would you like to configure
       // ESLint?" and rendered an arrow-key menu into the captured output.
@@ -561,7 +624,7 @@ function runStep(s, key) {
         failed.push(`${s.label} (tool missing, not a code failure)`);
         results.set(s.label, { state: 'unchecked', seconds: +dt });
       } else if (code === 0) {
-        printResult(s.label, `${C.g}pass${C.n} ${C.d}(${dt}s)${C.n}`);
+        printResult(s.label, `${C.g}pass${C.n} ${C.d}(${dt}s${how ? `, ${how}` : ''})${C.n}`);
         results.set(s.label, { state: 'pass', seconds: +dt });
         if (key) cache[key] = { label: s.label, at: new Date().toISOString(), seconds: +dt, sha: head };
       } else if (s.mode === 'warn') {
@@ -670,6 +733,24 @@ if (uncovered.length) {
   console.log(`${C.d}           Add them to .ci-local.json "extraSteps" if they matter here.${C.n}`);
 }
 if (cachedSteps.length) console.log(`${C.d}[local-ci] ${cachedSteps.length} step(s) from the pass cache, ~${saved}s saved (LOCAL_CI_NO_CACHE=1 to re-run)${C.n}`);
+
+// The time budget (added 2026-09-13). Two shapes of slow step were found the
+// hard way: nobler-os's `coverage floors` took 589 s of a 631 s gate and could
+// never be cached because it declared no `inputs`; PGP's frontend coverage went
+// from ~80 s to 856 s after a dependency relock and nothing said a word. Both
+// are cheap to notice here and expensive to notice anywhere else.
+const UNCACHEABLE_SLOW_S = 30;
+const STEP_BUDGET_S = 300;
+const inputsOf = new Map(steps.map((s) => [s.label, s.inputs]));
+for (const [label, r] of results) {
+  if (r.state !== 'pass' && r.state !== 'warn') continue;
+  if (label === 'audit' || label.endsWith(': audit')) continue; // asks the advisory DB, never cacheable by design
+  if (!inputsOf.get(label) && r.seconds >= UNCACHEABLE_SLOW_S) {
+    console.log(`${C.y}[local-ci] ⚠  ${label} took ${r.seconds}s and can never be cached - give it "inputs" in .ci-local.json${C.n}`);
+  } else if (r.seconds >= STEP_BUDGET_S) {
+    console.log(`${C.y}[local-ci] ⚠  ${label} took ${r.seconds}s - over the ${STEP_BUDGET_S}s step budget; a step this slow usually just got slower (profile it)${C.n}`);
+  }
+}
 if (warned.length) console.log(`${C.y}[local-ci] warnings (not blocking): ${warned.join(', ')}${C.n}`);
 if (failed.length) {
   console.log(`${C.r}[local-ci] FAILED in ${total}s: ${failed.join(', ')}${C.n}`);

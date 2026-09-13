@@ -5,9 +5,13 @@
 # Exit 0 - yes, provably. The caller may skip its own typecheck/test run.
 # Exit 1 - no, or cannot prove it. The caller MUST run its own checks.
 #
-# Usage, from a deploy script - NAME THE STEPS YOU INTEND TO SKIP:
+# Usage, from a deploy script - NAME THE STEPS YOU INTEND TO SKIP, exactly as
+# the marker records them (`steps` in .local-ci-pass.json): the script name in
+# a single-dir repo, "<dir>: <script>" in a multi-dir one, an extraStep's label
+# verbatim. A bare name in a multi-dir repo is refused (2026-09-13: `test` was
+# satisfied by one package's suite while another's was `test:ci`).
 #
-#     if ./scripts/ci-local-verdict.sh typecheck test; then
+#     if ./scripts/ci-local-verdict.sh "backend: typecheck" "backend: test:ci"; then
 #         info "Local CI gate already passed for this commit - skipping tests"
 #     else
 #         run_the_tests
