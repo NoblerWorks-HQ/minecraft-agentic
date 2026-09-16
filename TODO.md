@@ -32,9 +32,6 @@ Working task list for **minecraft-agentic**. Read this at the start of a work se
       (README note + docs/SETUP.md "battle-tested note": Gemini has the live mileage, Claude/OpenAI
       are test-pinned, please file issues). First real-world exercise will come from users.
 - [ ] Consider a hand-driven OBS capture of the hero clip if even higher fidelity is wanted - `npm run record` is headless (software-rendered), so the grass texture carries some compression noise at 800px.
-- [ ] Upload the social preview image - the one pre-public task only the repo owner can do in
-      the GitHub UI (Settings -> Social preview; `docs/media/crew-castle-cherry-1600x900-30JUL2026.png`
-      is the right shape). Link shares show the avatar until this is done.
 - [ ] Consider a shareable/hosted-tunnel option (e.g. one-liner to expose the local viewer) - only if there's real demand; keeps the "100% local" promise by default.
 - [ ] Draft launch post (HN / Reddit r/Minecraft+r/programming / X) - the demo clip now exists.
 
