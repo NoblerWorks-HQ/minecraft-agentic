@@ -75,6 +75,21 @@ const at = (blocks, x, y, z) => blocks.find((b) => b.x === x && b.y === y && b.z
     'and a window aimed at THIN AIR glazes nothing - the floating pane of glass is now impossible', dropped[0]);
 }
 {
+  // Live 2026-07-30: the model wrote windows as a plane and left out "z1", and each one was
+  // dropped. A window's missing second bound now defaults to its first.
+  const { canvas, dropped } = expandOps([
+    { op: 'walls', role: 'mason', x0: 0, z0: 0, x1: 5, z1: 5, y0: 0, y1: 3, type: 'stone_bricks' },
+    { op: 'window', role: 'mason', x0: 2, y0: 1, z0: 0, x1: 3, y1: 2, type: 'glass_pane' },
+  ]);
+  pass(canvas.roles.decorator.length === 4 && dropped.length === 0,
+    'a `window` that omits z1 is read as a plane at z0, not dropped', { panes: canvas.roles.decorator.length, dropped });
+}
+{
+  const { dropped } = expandOps([{ op: 'box', role: 'mason', x0: 0, y0: 0, z0: 0, x1: 3, y1: 3, type: 'stone_bricks' }]);
+  pass(/missing or non-numeric "z1"/.test(dropped[0]?.why || ''),
+    'but a `box` with a missing bound is still dropped - the default is window-only', dropped[0]);
+}
+{
   const { canvas } = expandOps([{ op: 'door', role: 'carpenter', x: 3, y: 1, z: 0, type: 'oak_door', facing: 'north' }]);
   const b = blocksOf(canvas);
   pass(b.length === 2 && /half=lower/.test(b[0].type) && /half=upper/.test(b[1].type) && b[1].y === 2,

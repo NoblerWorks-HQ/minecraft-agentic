@@ -7,7 +7,9 @@ Working task list for **minecraft-agentic**. Read this at the start of a work se
 ## Open
 
 - [ ] Consider giving the critic more than one round (it currently critiques once and applies one patch). Worth it only if the single pass proves to help - measure before adding cost.
-- [ ] 🟠 **A `window` op that omits `z1` is dropped, and the model omits it.** Found during the live
+- [x] ~~🟠 **A `window` op that omits `z1` is dropped, and the model omits it.**~~ ✅ 2026-09-18 fixed as proposed -
+      `src/ops.js` defaults a `window`'s missing second bound (x1/y1/z1) to its first, window-only;
+      `test/ops.test.mjs` pins both halves (window kept, `box` with a missing bound still dropped). Found during the live
       confirmation below: two of the watchtower's windows were refused with `missing or non-numeric
       "z1"`, so the tower came out with fewer windows than designed. The door is behaving correctly
       (guessing a bound is how a `box` eats the plot), but a window is naturally a *flat rectangle*

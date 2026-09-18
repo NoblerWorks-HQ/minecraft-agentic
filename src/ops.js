@@ -144,8 +144,18 @@ export function expandOps(ops, { limits = LIMITS } = {}) {
     // and guessing a bound is how you get a box that fills the plot.
     const a = {};
     let bad = null;
+    // A window is a flat rectangle, and a model writing one reasonably gives three coords and a
+    // plane - two of the watchtower's windows were dropped live for a missing "z1". For `window`
+    // (and only `window`) a missing second bound defaults to its first: unambiguous for a plane,
+    // and it cannot run away the way a guessed `box` bound fills the plot.
+    const src = name === 'window' ? { ...raw } : raw;
+    if (name === 'window') {
+      for (const ax of ['x', 'y', 'z']) {
+        if (int(src[`${ax}1`]) === null && int(src[`${ax}0`]) !== null) src[`${ax}1`] = src[`${ax}0`];
+      }
+    }
     for (const k of spec.args) {
-      const v = int(raw[k]);
+      const v = int(src[k]);
       if (v === null) { bad = `missing or non-numeric "${k}"`; break; }
       a[k] = /^(y|y0|y1)$/.test(k) ? clampY(v) : /^r/.test(k) ? clamp(v, 1, limits.maxRadius) : clampXZ(v);
     }
@@ -175,7 +185,7 @@ export function expandOps(ops, { limits = LIMITS } = {}) {
     // a window aimed at thin air is a no-op instead of a floating cube. The glazing is the
     // decorator's, so exactly one role ends up owning the coordinate.
     if (name === 'window') {
-      const removed = canvas.punch(role, punchPoints(raw, limits));
+      const removed = canvas.punch(role, punchPoints(src, limits));
       if (!removed.length) {
         dropped.push({ op: 'window', why: `no ${role} wall at those coordinates - nothing to glaze` });
         continue;
