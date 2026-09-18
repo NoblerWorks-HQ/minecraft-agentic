@@ -182,5 +182,58 @@ pass(normalizeType('') === null && normalizeType(null) === null, 'an empty type 
   pass(spec.ops.length < 40, 'and it does it in a handful of ops - which is the entire point', { ops: spec.ops.length });
 }
 
+// --- decorator puts need something to hang on (the window treatment, for all decoration) -----
+{
+  const wall = { op: 'walls', role: 'mason', x0: 0, z0: 0, x1: 6, z1: 6, y0: 0, y1: 4, type: 'stone_bricks' };
+  const { canvas, dropped, applied } = expandOps([
+    wall,
+    { op: 'put', role: 'decorator', x: 3, y: 3, z: -1, type: 'lantern' },      // on the wall face: kept
+    { op: 'put', role: 'decorator', x: 3, y: 6, z: -4, type: 'lantern' },      // mid-air: dropped
+    { op: 'put', role: 'decorator', x: 12, y: 0, z: 12, type: 'lantern' },     // on the ground: kept
+    { op: 'put', role: 'decorator', x: 3, y: 5, z: 3, type: 'glass' },         // resting on nothing: dropped
+  ]);
+  const dec = canvas.roles.decorator;
+  pass(!!at(dec, 3, 3, -1), 'a decorator put touching a wall face is kept');
+  pass(!!at(dec, 12, 0, 12), 'a decorator put standing on the ground (y = 0) is kept');
+  pass(!at(dec, 3, 6, -4), 'a decorator put floating in mid-air is dropped');
+  pass(!at(dec, 3, 5, 3), 'a pane hovering over the empty middle of the plot is dropped');
+  const floats = dropped.filter((d) => d.op === 'put');
+  pass(floats.length === 2 && floats.every((d) => /would float/.test(d.why)), 'and each drop is reported, never silent', floats);
+  pass(applied === 3, 'dropped puts do not count as applied', { applied });
+}
+{
+  // Order-independent: a put listed BEFORE the wall it hangs on is judged against the finished canvas.
+  const { canvas, dropped } = expandOps([
+    { op: 'put', role: 'decorator', x: 3, y: 3, z: -1, type: 'lantern' },
+    { op: 'walls', role: 'mason', x0: 0, z0: 0, x1: 6, z1: 6, y0: 0, y1: 4, type: 'stone_bricks' },
+  ]);
+  pass(!!at(canvas.roles.decorator, 3, 3, -1) && dropped.length === 0, 'a put listed before its wall is still kept', dropped);
+}
+{
+  // A chain of puts hanging from a beam is supported link by link.
+  const { canvas, dropped } = expandOps([
+    { op: 'floor', role: 'carpenter', x0: 0, z0: 0, x1: 4, z1: 4, y: 8, type: 'oak_planks' },
+    { op: 'put', role: 'decorator', x: 2, y: 6, z: 2, type: 'lantern' },   // listed first, hangs off the chain
+    { op: 'put', role: 'decorator', x: 2, y: 7, z: 2, type: 'chain' },     // hangs off the floor
+  ]);
+  pass(!!at(canvas.roles.decorator, 2, 6, 2) && !!at(canvas.roles.decorator, 2, 7, 2) && dropped.length === 0,
+    'a lantern on a chain under a beam is kept (support propagates through other puts)', dropped);
+}
+{
+  // Only the decorator's puts are checked; other roles' puts and the window glazing are untouched.
+  const { canvas, dropped } = expandOps([
+    { op: 'walls', role: 'mason', x0: 0, z0: 0, x1: 6, z1: 6, y0: 0, y1: 4, type: 'stone_bricks' },
+    { op: 'window', role: 'mason', x0: 2, y0: 2, z0: 0, x1: 3, y1: 3, z1: 0, type: 'glass_pane' },
+    { op: 'put', role: 'carpenter', x: 20, y: 9, z: 20, type: 'oak_planks' },
+  ]);
+  pass(!!at(canvas.roles.carpenter, 20, 9, 20), "another role's put is not support-checked");
+  pass(canvas.roles.decorator.length === 4 && dropped.length === 0, 'window glazing is not treated as a floating put', { glass: canvas.roles.decorator.length, dropped });
+}
+{
+  const spec = JSON.parse(readFileSync(new URL('../src/plans/reference-ops.json', import.meta.url), 'utf8'));
+  const { dropped } = expandOps(spec.ops);
+  pass(!dropped.some((d) => /would float/.test(d.why)), 'the worked example the model imitates has no floating decoration', dropped);
+}
+
 console.log(failed ? `\n${failed} failure(s)` : '\nAll ops checks passed.');
 process.exit(failed ? 1 : 0);

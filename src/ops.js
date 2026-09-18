@@ -48,7 +48,7 @@ export const OPS = {
   ring:  { args: ['cx', 'cz', 'r', 'y'], type: true, doc: 'a single circular outline at height y (a balcony rail, a crown)' },
   cone:  { args: ['cx', 'cz', 'r0', 'y0'], type: true, doc: 'a stepped spire from radius r0 at y0 up to a point. Use a *_stairs type and the shingles orient themselves' },
   door:  { args: ['x', 'y', 'z'], type: true, facing: true, doc: 'a door - places BOTH halves. Needs a solid block below it, from an earlier role' },
-  put:   { args: ['x', 'y', 'z'], type: true, doc: 'one single block (a torch, a lantern, a detail)' },
+  put:   { args: ['x', 'y', 'z'], type: true, doc: 'one single block (a torch, a lantern, a detail). A decorator put must touch a placed block or stand on the ground - one floating in mid-air is dropped' },
   punch: { args: [], type: false, doc: 'CARVE AN OPENING (a doorway, an arch): removes blocks from this role\'s own list. Give pts [[x,y,z],...] or a box x0,y0,z0,x1,y1,z1' },
   window: { args: ['x0', 'y0', 'z0', 'x1', 'y1', 'z1'], type: true, doc: 'A GLAZED WINDOW, in one op: punches the hole out of THIS role\'s wall and fills it with glass. Use this for every window - do not punch and glaze separately' },
   scatter: { args: ['x0', 'z0', 'x1', 'z1', 'y'], type: true, density: true, doc: 'sprinkle a block randomly over a rectangle at height y (grass, flowers). density 0..1' },
@@ -125,6 +125,8 @@ export function expandOps(ops, { limits = LIMITS } = {}) {
   const dropped = [];
   let applied = 0;
   let total = 0;
+  // Decorator `put` blocks, checked for support once every op has landed (see below).
+  const decoratorPuts = [];
 
   const list = Array.isArray(ops) ? ops.slice(0, limits.maxOps) : [];
   if (Array.isArray(ops) && ops.length > limits.maxOps) {
@@ -214,7 +216,10 @@ export function expandOps(ops, { limits = LIMITS } = {}) {
       case 'disc': canvas.disc(role, a.cx, a.cz, a.r, a.y, type); break;
       case 'ring': canvas.ring(role, a.cx, a.cz, a.r, a.y, type); break;
       case 'cone': canvas.cone(role, a.cx, a.cz, a.r0, a.y0, type); break;
-      case 'put': canvas.put(role, a.x, a.y, a.z, type); break;
+      case 'put':
+        canvas.put(role, a.x, a.y, a.z, type);
+        if (role === 'decorator') decoratorPuts.push(canvas.roles.decorator.at(-1));
+        break;
       case 'door': {
         const facing = ['north', 'south', 'east', 'west'].includes(raw.facing) ? raw.facing : 'north';
         canvas.door(role, a.x, a.y, a.z, type.split('[')[0], facing);
@@ -231,6 +236,43 @@ export function expandOps(ops, { limits = LIMITS } = {}) {
     }
     applied++;
     total += cost;
+  }
+
+  // SUPPORT CHECK on the decorator's single-block `put`s - the window treatment, for the rest of
+  // the decoration. A model places lanterns and panes "near" the building, and a put one block
+  // off the wall is a cube floating in mid-air: the critic flagged it on live builds, and the
+  // server keeps it there because /setblock ignores support. A put survives if it stands on the
+  // ground (y <= 0: the surface is y = -1) or touches, on any of its six faces, a block some op
+  // actually placed - including another supported put, so a lantern hung from a chain hung from
+  // a beam is kept. Run AFTER every op, so a put listed before the wall it hangs on is not
+  // judged against a half-built canvas.
+  // (A put a later punch carved away is no longer in the canvas and takes no part.)
+  const livePuts = new Set(canvas.roles.decorator);
+  const checkedPuts = decoratorPuts.filter((b) => livePuts.has(b));
+  if (checkedPuts.length) {
+    const key = (x, y, z) => `${x},${y},${z}`;
+    const putSet = new Set(checkedPuts);
+    const solid = new Set();
+    for (const r of ROLES) for (const b of canvas.roles[r]) if (!putSet.has(b)) solid.add(key(b.x, b.y, b.z));
+    let pending = checkedPuts.slice();
+    for (let changed = true; changed && pending.length; ) {
+      changed = false;
+      const next = [];
+      for (const b of pending) {
+        const touches = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]
+          .some(([dx, dy, dz]) => solid.has(key(b.x + dx, b.y + dy, b.z + dz)));
+        if (b.y <= 0 || touches) { solid.add(key(b.x, b.y, b.z)); changed = true; } else next.push(b);
+      }
+      pending = next;
+    }
+    if (pending.length) {
+      const floating = new Set(pending);
+      canvas.roles.decorator = canvas.roles.decorator.filter((b) => !floating.has(b));
+      for (const b of pending) {
+        dropped.push({ op: 'put', why: `decorator ${b.type} at ${b.x},${b.y},${b.z} would float - nothing below, above or beside it` });
+      }
+      applied -= pending.length;
+    }
   }
 
   const blocks = ROLES.reduce((s, r) => s + canvas.roles[r].length, 0);
