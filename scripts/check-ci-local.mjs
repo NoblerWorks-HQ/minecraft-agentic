@@ -22,6 +22,22 @@
  * last run - RUNS the gate. Being wrong about "Actions has this" means
  * shipping unchecked code; being wrong the other way costs four minutes.
  *
+ * GREEN IS NOT ENOUGH - CI MUST RUN ON THIS PUSH (2026-09-18). rocketscan's
+ * ci.yml dropped its `push` trigger; its last green run was a manual
+ * (workflow_dispatch) run on an older commit, and the gate stood down on it,
+ * so pushes to main got no check at all until forced by hand. Twelve repos
+ * dropped `push` in the CI-minutes pass. The stand-down now needs BOTH:
+ *   - the PUSHED commit's ci.yml is triggered by a push to the pushed branch
+ *     (`on: push`, a `branches`/`branches-ignore` filter that admits it, no
+ *     `paths`/`paths-ignore` filter - the push may touch only ignored paths),
+ *     and the branch is known (the hook's remote ref, else HEAD's branch);
+ *   - the last `push`-event run of ci.yml ON THAT BRANCH is green (or queued /
+ *     in progress) and under 30 days old. Manual, scheduled, PR and other-branch
+ *     runs never count.
+ * A repo with no push trigger therefore ALWAYS runs the gate - which, since
+ * the CI-minutes pass, is most of the fleet, and is the point: there the gate
+ * is the only check a push to main gets.
+ *
  * IT REMEMBERS WHAT IT ALREADY PROVED (2026-09-13). On 2026-09-12 every CI run
  * in all eleven repos had died on the Actions budget, so the stand-down above
  * never fired, and a one-file Terraform merge into achilles re-ran all twelve
@@ -92,9 +108,11 @@ if (process.env.SKIP_LOCAL_CI === '1') {
   process.exit(0);
 }
 
-// argv: [range] [pushed sha]. The pre-push hook passes both; older hooks pass only the range.
+// argv: [range] [pushed sha] [remote ref]. The pre-push hook passes all three;
+// older hooks pass only the first one or two, and the branch then comes from HEAD.
 const range = process.argv[2] || '';
 const pushedSha = /^[0-9a-f]{40}$/.test(process.argv[3] || '') ? process.argv[3] : '';
+const remoteRef = /^refs\//.test(process.argv[4] || '') ? process.argv[4] : '';
 const readJson = (p) => { try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; } };
 const git = (args) => spawnSync('git', args, { cwd: ROOT, encoding: 'utf8' });
 const gitOut = (args) => (git(args).stdout || '').trim();
@@ -251,18 +269,122 @@ if (range) {
   }
 }
 
+// ── will ci.yml run on THIS push? (2026-09-18) ──────────────────────────────
+// A green run proves Actions is alive; it does not prove Actions will check
+// this push. rocketscan's ci.yml dropped its `push` trigger on 2026-09-18, its
+// last run was a green workflow_dispatch on an older commit, and the gate stood
+// down on that - so pushes reached main with no check at all. Twelve fleet
+// repos dropped `push` in the CI-minutes pass (2026-09-10..18). So before the
+// run history is even asked, the pushed commit's ci.yml must say that a push to
+// this branch triggers it.
+//
+// A deliberately small reader for the `on:` block, not a YAML parser. Returns
+// null when a push to `branch` triggers the workflow, else a reason. Anything
+// it does not fully understand is a reason: flow maps, path filters (the push
+// may touch only ignored paths), glob characters beyond `*` / `**` / `!`.
+function pushTriggerReason(yml, branch) {
+  const lines = yml.split('\n')
+    .map((l) => l.replace(/(^|\s)#.*$/, '').replace(/\s+$/, ''))
+    .filter((l) => l.trim() !== '');
+  const ind = (l) => l.length - l.trimStart().length;
+  const unq = (s) => s.trim().replace(/^(['"])(.*)\1$/, '$2');
+  const list = (s) => { // "[a, b]" | "a" -> [a, b]
+    const t = s.trim();
+    return (t.startsWith('[') && t.endsWith(']') ? t.slice(1, -1).split(',') : [t]).map(unq).filter(Boolean);
+  };
+  // The children of lines[i]: its inline value, or the more-indented lines under it.
+  const block = (i) => {
+    const out = [];
+    for (let j = i + 1; j < lines.length && ind(lines[j]) > ind(lines[i]); j++) out.push(lines[j]);
+    return out;
+  };
+  const keyOf = (l) => { const m = l.trim().match(/^(['"]?)([\w-]+)\1\s*:(?:\s+(.*))?$/); return m ? { k: m[2], v: m[3] ?? '' } : null; };
+
+  const onIdx = lines.findIndex((l) => ind(l) === 0 && /^(['"]?)(on|true)\1\s*:/.test(l));
+  if (onIdx === -1) return 'ci.yml has no `on:` block';
+  const onVal = keyOf(lines[onIdx])?.v ?? '';
+  if (onVal) {
+    if (onVal.startsWith('{')) return 'ci.yml `on:` is a flow map this gate does not read';
+    return list(onVal).includes('push') ? null : 'ci.yml is not triggered on push';
+  }
+  const kids = block(onIdx);
+  if (!kids.length) return 'ci.yml has an empty `on:` block';
+  const kidInd = ind(kids[0]);
+  if (kids[0].trim().startsWith('- ')) { // on:\n  - push
+    return kids.some((l) => unq(l.trim().slice(2)) === 'push') ? null : 'ci.yml is not triggered on push';
+  }
+  const at = kids.findIndex((l) => ind(l) === kidInd && keyOf(l)?.k === 'push');
+  if (at === -1) return 'ci.yml is not triggered on push';
+  const pushLine = onIdx + 1 + at;
+  const pushVal = keyOf(lines[pushLine]).v;
+  if (pushVal === '{}' || pushVal === '~' || pushVal === 'null') return null;
+  if (pushVal) return 'ci.yml `push:` has an inline value this gate does not read';
+
+  // push: with filters. key -> list of values.
+  const filters = {};
+  const body = block(pushLine);
+  for (let j = 0; j < body.length; j++) {
+    if (ind(body[j]) !== ind(body[0])) continue;
+    const kv = keyOf(body[j]);
+    if (!kv) return 'ci.yml `push:` block is not readable';
+    const vals = kv.v ? list(kv.v) : [];
+    for (let n = j + 1; n < body.length && ind(body[n]) > ind(body[j]); n++) {
+      const t = body[n].trim();
+      if (!t.startsWith('- ')) return `ci.yml \`push.${kv.k}\` is not readable`;
+      vals.push(unq(t.slice(2)));
+    }
+    filters[kv.k] = vals;
+  }
+  if (filters.paths || filters['paths-ignore']) return 'ci.yml push trigger is path-filtered, so this push may not run it';
+  const branches = filters.branches, ignored = filters['branches-ignore'];
+  if (!branches && !ignored) {
+    // Only tag filters => branch pushes do not trigger it.
+    return filters.tags || filters['tags-ignore'] ? 'ci.yml push trigger is tags-only' : null;
+  }
+  if (!branch) return 'cannot tell which branch is being pushed';
+  const toRe = (p) => {
+    if (/[?+[\]]/.test(p)) return null;
+    const src = p.split('**').map((s) => s.split('*').map((x) => x.replace(/[.\\^$|(){}]/g, '\\$&')).join('[^/]*')).join('.*');
+    return new RegExp(`^${src}$`);
+  };
+  let hit = false;
+  for (const raw of branches ?? ignored) {
+    const neg = raw.startsWith('!');
+    const re = toRe(neg ? raw.slice(1) : raw);
+    if (!re) return `ci.yml branch filter \`${raw}\` uses glob syntax this gate does not read`;
+    if (re.test(branch)) hit = !neg; // last matching pattern wins, as on GitHub
+  }
+  const triggered = branches ? hit : !hit;
+  return triggered ? null : `ci.yml is not triggered on push to ${branch}`;
+}
+
 // ── is GitHub Actions actually covering this push? ───────────────────────────
 // Returns a reason to RUN the gate, or null when Actions is confirmed healthy
-// and we can stand down. Every failure path returns a reason: we skip only on
-// evidence, never on the absence of it.
+// AND will run ci.yml on this push, so we can stand down. Every failure path
+// returns a reason: we skip only on evidence, never on the absence of it.
 function reasonToRunGate() {
   if (process.env.LOCAL_CI_FORCE === '1') return 'LOCAL_CI_FORCE=1';
   if (!existsSync(join(ROOT, '.github/workflows/ci.yml'))) return 'no .github/workflows/ci.yml';
 
+  // The branch GitHub will see: the remote ref from the hook, else HEAD's branch.
+  const branch = remoteRef.startsWith('refs/heads/') ? remoteRef.slice('refs/heads/'.length)
+    : remoteRef ? '' : gitOut(['symbolic-ref', '--short', '-q', 'HEAD']);
+  if (!branch) return remoteRef ? `pushing ${remoteRef}, not a branch` : 'cannot tell which branch is being pushed';
+
+  // Read the workflow AS PUSHED: GitHub triggers on the pushed commit's ci.yml,
+  // and a commit that removes `push` must not be waved through by the old file.
+  const pushedYml = pushedSha ? git(['show', `${pushedSha}:.github/workflows/ci.yml`]) : null;
+  const yml = pushedYml && pushedYml.status === 0 ? pushedYml.stdout
+    : readFileSync(join(ROOT, '.github/workflows/ci.yml'), 'utf8');
+  const trig = pushTriggerReason(yml, branch);
+  if (trig) return trig;
+
+  // Only a PUSH run on THIS branch speaks for this push. A green manual
+  // (workflow_dispatch) or scheduled run, or one on another branch, does not.
   const gh = spawnSync(
     'gh',
-    ['run', 'list', '--workflow', 'ci.yml', '--limit', '1',
-     '--json', 'conclusion,status,createdAt,updatedAt,url'],
+    ['run', 'list', '--workflow', 'ci.yml', '--event', 'push', '--branch', branch, '--limit', '1',
+     '--json', 'conclusion,status,createdAt,updatedAt,url,event,headBranch'],
     { cwd: ROOT, encoding: 'utf8', timeout: 15000 }
   );
   if (gh.error || gh.status !== 0) {
@@ -274,9 +396,12 @@ function reasonToRunGate() {
 
   let runs;
   try { runs = JSON.parse(gh.stdout || '[]'); } catch { return 'gh returned unparseable JSON'; }
-  if (!Array.isArray(runs) || runs.length === 0) return 'no CI runs on record';
+  if (!Array.isArray(runs) || runs.length === 0) return `no push-triggered CI runs on ${branch}`;
 
   const [last] = runs;
+  // Belt and braces: never let a run of another event or branch speak for this push.
+  if (last.event && last.event !== 'push') return `last CI run is a ${last.event} run, not a push`;
+  if (last.headBranch && last.headBranch !== branch) return `last CI run is on ${last.headBranch}, not ${branch}`;
   // A queued or running job is itself proof that Actions is ALIVE: the outage
   // this gate substitutes for kills runs in ~3s before a runner is ever
   // assigned, so nothing ever reaches these states under it. Treating them as
