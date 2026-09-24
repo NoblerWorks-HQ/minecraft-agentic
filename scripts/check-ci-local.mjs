@@ -200,7 +200,31 @@ if (process.argv.includes('--verdict')) {
   const m = readJson(join(ROOT, '.local-ci-pass.json'));
   if (!m) no('no pass marker (this gate has not passed here for a clean tree).');
   if (m.v !== 1) no(`marker version ${JSON.stringify(m.v)} is not one this script understands.`);
-  if (m.sha !== head) no(`marker is for ${String(m.sha).slice(0, 8)}, HEAD is ${head.slice(0, 8)}.`);
+  // DOCS-ONLY COMMITS CARRY THE MARKER FORWARD (2026-09-24). A `TODO.md` line
+  // committed between push and deploy used to throw the marker away - the push
+  // of that commit took the docs-only skip below, which writes no marker - so
+  // achilles' 2026-09-23 deploy re-ran ~8,400 tests over a one-line docs diff.
+  // The marker still speaks for HEAD when HEAD descends from the marked commit
+  // and every file changed since matches `docsOnlyIgnore`: exactly the claim the
+  // docs-only push skip already makes, no wider. A rebase (not a descendant),
+  // any non-docs file, or a diff git cannot produce -> no.
+  let carried = '';
+  if (m.sha !== head) {
+    const markSha = /^[0-9a-f]{40}$/.test(String(m.sha)) ? m.sha : '';
+    const stale = `marker is for ${String(m.sha).slice(0, 8)}, HEAD is ${head.slice(0, 8)}`;
+    if (!markSha || git(['merge-base', '--is-ancestor', markSha, head]).status !== 0) {
+      no(`${stale}, and HEAD does not descend from it.`);
+    }
+    const d = git(['diff', '--name-only', markSha, head]);
+    if (d.status !== 0) no(`${stale}, and git cannot diff the two.`);
+    const changed = d.stdout.split('\n').filter(Boolean);
+    const res = ignoreGlobs.map((g) => new RegExp(g));
+    const code = changed.filter((f) => !res.some((re) => re.test(f)));
+    if (code.length) {
+      no(`${stale}, and ${code.length} non-docs file(s) changed since: ${code.slice(0, 3).join(', ')}${code.length > 3 ? ', ...' : ''}.`);
+    }
+    carried = ` (carried from ${markSha.slice(0, 8)} across ${changed.length} docs-only file(s))`;
+  }
   if (m.lock !== lockHash()) no('dependencies changed since the gate ran.');
   if (m.gate !== gateHash()) no('the gate itself changed since the marker was written.');
 
@@ -253,7 +277,7 @@ if (process.argv.includes('--verdict')) {
     no(`marker does not cover the request: ${problems.join('; ')} (it recorded: ${[...covered].join(', ') || 'nothing'}).`);
   }
 
-  say(`gate passed for ${head.slice(0, 8)} covering ${required.join(', ')} (clean tree, deps and gate unchanged).`);
+  say(`gate passed for ${head.slice(0, 8)} covering ${required.join(', ')} (clean tree, deps and gate unchanged)${carried}.`);
   process.exit(0);
 }
 
