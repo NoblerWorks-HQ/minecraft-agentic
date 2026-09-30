@@ -3,6 +3,7 @@
 > Canonical full text. Moved out of the root `CLAUDE.md` on 2026-09-06 for the
 > session context budget (that file loads in full every session; it was
 > 46,779 bytes). It carries each invariant with the incident that produced it, the proof, and the file that owns the rule.
+> The viewer/boot, self-correction-loop and ops sections followed on 2026-09-30.
 > The CLAUDE.md digest keeps the RULES; this doc keeps the detail and the
 > evidence they came from. **Change one, change the other in the same commit.**
 
@@ -309,3 +310,125 @@
   CubeCamera pass whose 6 face cameras sit at the origin, and parking one of those makes picks
   unproject through an identity camera and miss at random. Run it after touching the viewer proxy
   or the page.
+
+---
+
+## The browser viewer and the panel boot
+
+`src/viewer.js` starts a `prismarine-viewer` web view (default `http://localhost:3000`) so anyone
+can watch a build in a browser without a Minecraft client - the headline feature for open-source
+appeal. It's opt-out via `VIEWER=off` / `--no-viewer` and port-configurable via `VIEWER_PORT`.
+`startViewer(bot)` is called on the single bot in `demo.js`/`index.js` and on the first worker only
+in `crew.js` (one shared view; all bots share the world). `scripts/web.js` starts it with
+`{ prefix: '/viewer', quiet: true }` and reverse-proxies it (HTTP + the socket.io websocket upgrade)
+so the whole web UI - prompt box, log, 3D view - is ONE url (`:8080`); the prefix works because the
+viewer client derives its socket.io path from `location.pathname`. It never throws: the `prismarine-viewer`
+import is dynamic and try/caught, so a missing/broken native `canvas` module degrades to
+"watch in-game" instead of crashing the build. `canvas` is an `optionalDependency` for exactly
+this reason - `npm install` must never hard-fail on it. Setup + fallback docs: `docs/SETUP.md`.
+
+**`scripts/web.js` listens and opens the browser BEFORE it boots anything.** Startup (server ->
+crew -> viewer) takes ~30-60s, and doing it first meant all of that progress existed only in the
+terminal - the auto-opened browser landed on an already-finished panel. `main()` now calls
+`server.listen()` + `openBrowser()` up front, then runs the boot as three broadcast steps, and the
+page opens on a loading screen that renders them live with the SSE log tailed underneath. Two
+constraints hold this together: boot state travels inside `publicState()` (not a separate event) so
+a late connect or a mid-boot reload resolves correctly from a plain `GET /status`, and the viewer
+iframe must NOT be given a `src` until boot completes - `VIEWER_PORT` isn't chosen until then, so an
+eager load just pins the iframe to the proxy's 502 page. Anything added to the boot path belongs in
+the `boot.steps` list, or it goes back to being invisible outside the terminal.
+
+**The 3D pane keeps its own preloader AFTER boot - dismissed on real mesh progress, never on the
+iframe's `load` event.** `load` fires when the viewer's HTML arrives, which is 10-40s before the
+world has streamed and meshed; hiding the cover there left a black pane that read as frozen (user
+report, 2026-07-30). The overlay (`.vload` + `showVload()`/`pollVload()` in the page) instead
+watches actual readiness through the same-origin iframe: the injected hook (`src/viewer-hook.js`)
+collects the viewer's three.js scenes on `window.__scenes` (pinned by `npm test`), the parent polls
+the biggest scene's child count - one child per meshed chunk section, the sky's cube-map scene
+stays tiny so max() skips it - and dismisses when meshing settles (>=24 sections, 2.5s no growth),
+with a timeout so the viewer-unavailable fallback page is never trapped behind it. Progress stages
+are honest: HTML loaded -> `__cam` parked (first to-screen render) -> section count asymptote. The
+same overlay covers scene-travel reloads (`reframeViewer`).
+
+## The two self-correction loops
+
+After the last block lands, `Crew.finishBuild()` runs two passes that answer two different
+questions. They are ordered, and the order is load-bearing: a build with holes in it photographs
+badly, so a critic shown a half-finished structure spends its whole patch fixing damage the free
+pass would have fixed. **Fix what's broken, THEN ask whether it's any good.**
+- **REPAIR (`src/repair.js`, free, always on) - "did the world accept it?"** `verifyBuild` already
+  found the blocks that never landed and did nothing but print the count. Now they are re-placed
+  (y-ascending, by their owning role). **If a round fixes zero blocks, STOP** - those blocks are not
+  dropped commands, they are physically illegal (a torch on air, a door with no floor, gravel over
+  water), and a third identical `/setblock` is refused identically. Escalate instead: with a live
+  provider, the model is shown each failure *with the reason the game refused it* (what is at the
+  coord now, what is under it) and returns a patch. Borrowed from Voyager.
+- **REVIEW (`src/critic.js`, costs a vision call, opt-in via `CRITIC=on` or the panel's checkbox) -
+  "is it any good?"** The game has no opinion about a tower with no windows. `src/shot.js` drives a
+  headless browser against the live viewer, orbits it for 3 angles, and the model gets the pictures
+  **next to `planDigest()`'s ASCII floor maps of its own plan**. Both halves are required: given only
+  the plan the model re-reads its own homework and approves it; given only a photo it can describe
+  the flaw but cannot say WHERE it is. Borrowed from APT.
+- **The critic's shot must be FRAMED on the build, or the model critiques the lawn.** The browser's
+  orbit camera looks at the camera bot from 20 up / 20 south, so that bot's position IS the centre
+  of the picture - and during a build it stands at the CORNER of the site (`aimCamera`), because at
+  that point there is nothing to centre on yet. `Crew.frameBuild()` re-parks it on the plan's
+  bounding-box centre before the shot, **in all three axes**. Both halves were found by looking at
+  the actual PNGs: parked at the origin, the tower sat in the corner of an acre of grass, half out
+  of frame; then parked at ground level, the shot aimed at the tower's FEET and the whole top half
+  (32-block build) fell off the top of the frame. This is the one moment it is safe to move the
+  camera - the last block has landed and the next build hasn't started. Pinned by `npm run test:loops`.
+- **Every patch from a model is untrusted input - and it is exactly as untrusted as an op, so it
+  goes through the same three checks `expandOps` makes.** `normalizePatch()` is the only door: it
+  converts plan-relative coords to world-absolute (get that backwards and the fix lands on the
+  neighbouring plot), **clamps them to the plot in the RELATIVE frame first** (clamping world
+  coordinates against plot-relative bounds would land the whole patch on the origin), **validates
+  the block name against the real 1.20.1 registry via `normalizeType`** - repairing near-misses
+  (`stone_brick` -> `stone_bricks`) and dropping hallucinations, since `/setblock ...
+  minecraft:wooden_plank` is discarded by the server without a word and the hole it was meant to
+  fix just stays - coerces unknown roles, and **drops any entry with no block type** (that one goes
+  out as `minecraft:undefined`). The name check and the clamp were missing here for as long as
+  `expandOps` had them; added 2026-07-29. `npm run test:loops` pins all of it.
+- A patch is applied to the **PLAN**, not just the world (`applyPatch`), so the next `verifyBuild`
+  holds the patched design to account too. The design is what improved, not just the output.
+
+## The model designs in OPS, not in blocks
+
+**The presets were never better because a human designed them - they were better because a human
+gave them PRIMITIVES.** A preset says `walls(...)` and gets 400 gap-free blocks; the model was
+asked for that same wall as a JSON array with one object per block, ~11 tokens each. A 900-block
+build is then ~10k tokens of pure mechanical enumeration and the castle (3,338 blocks) is ~38k -
+which no output budget could buy. So the model did what anyone would when told to enumerate
+thousands of tedious items: it shortcut, returning **74 blocks with holes in the walls**, and our
+own critic scored it **3/10** and was right.
+- `src/ops.js` gives the model the SAME primitives, via `src/library/canvas.js` (extracted from
+  the library so presets and AI builds are expanded by identical code). An op is one line and
+  expands to hundreds of blocks (~28x compression), so the model can finally afford the scale we
+  ask for and spends its budget on DESIGN instead of typing. Same prompt, measured: **74 blocks /
+  3/10 -> 2,773 blocks / 10/10, 0 missing.**
+- **The point is not compression, it is that the old mistakes become IMPOSSIBLE.** A `walls` op is
+  gap-free by construction; `door` always places both halves; `cone` orients its own stair
+  shingles. Every rule this crew learned the hard way used to be *requested in prose* and
+  reproduced by hand hundreds of times without a slip. Now it is enforced once, in code.
+- **If a rule needs two ops to AGREE, make it one op.** Glazing was `punch` the wall + place the
+  glass, and the model got the two coordinate sets subtly out of step: the live 10/10 build had
+  **panes of glass floating in mid-air outside the tower**, which the critic never mentioned. The
+  `window` op now carves and glazes in one move, and glazes ONLY coordinates where a wall was
+  really removed (`canvas.punch` returns what it removed) - so a window aimed at thin air is a
+  no-op instead of a floating cube. `door` was already this shape; `window` is the same lesson.
+- **Every op is UNTRUSTED INPUT** - the same job `normalizePatch` does in `repair.js`. `expandOps`
+  is the only door: it clamps coords to the plot (or the fix lands on the neighbour's build),
+  refuses a runaway op outright (clamping a world-sized `box` still fills the plot solid), caps the
+  total, coerces unknown roles, drops unknown ops - and **validates block names against the real
+  1.20.1 registry**, repairing near-misses (`stone_brick` -> `stone_bricks`) and dropping the rest.
+  A hallucinated name is the quietest failure in the project: `/setblock` discards it without a
+  word, leaving holes nothing in the log explains. A model that ignores the format and returns raw
+  BLOCKS is converted to `put` ops and goes through the same door.
+- **The op reference in the coordinator's prompt is GENERATED from the `OPS` table**, so the prompt
+  cannot describe an op that does not exist or miss one that does.
+- **The worked example (`src/plans/reference-ops.json`) is the most-copied build in the project** -
+  it is shown to the model on EVERY request, so if it degrades, every AI build degrades with it. It
+  is therefore audited on the same parallel-physics simulator as the thirteen presets
+  (`npm run test:presets`), and writing it flushed out two real bugs the audit caught before any
+  model ever saw it: flowers scattered onto ground that `executeBuild` had cleared to air, and a
+  door hung before the mason's foundation reached it. Pinned by `npm run test:ops`.

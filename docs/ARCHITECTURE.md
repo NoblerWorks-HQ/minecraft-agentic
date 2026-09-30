@@ -2,7 +2,7 @@
 
 How a prompt becomes a building, and why the pieces are shaped the way they are.
 This is the front door; the exhaustive version - every invariant, with the bug that
-earned it - lives in [CLAUDE.md](../CLAUDE.md).
+earned it - lives in [INVARIANTS.md](INVARIANTS.md) (digest in the root CLAUDE.md).
 
 ## The pipeline
 
@@ -98,3 +98,58 @@ The recurring theme: this codebase's failures are *silent* (an unopped bot place
 nothing, a disconnected bot chats into the void, an oversized `/fill` is refused
 without a word), so almost every test re-reads the world or the wire instead of
 trusting a success counter.
+
+## Source map
+
+One line per file (moved from the root CLAUDE.md, 2026-09-30).
+
+```
+src/
+  bot.js          Mineflayer bot connection
+  builder.js      block placement logic
+  worker.js       individual worker bot with personality (loaded from profiles/)
+  profiles/       THE CREW AS DATA - one JSON per role (name, phrases, materials, hard rules).
+  profiles.js       Feeds both the bots and the coordinator's prompt. Order = build timeline.
+  coordinator.js  plans + assigns work across the crew (via providers, or library if no key).
+                  Its team paragraph is GENERATED from profiles/, and it shows the model a
+                  matching library preset as a worked example (pickExample; FEWSHOT=off)
+  crew.js         multi-agent orchestration + finishBuild() (the two loops below)
+  repair.js       REPAIR loop: re-place what never landed; ask the model why the rest won't
+                  stay. Also owns normalizePatch/applyPatch - the ONLY door for model patches
+  critic.js       REVIEW loop: show the finished build to a vision model, apply its patch
+  shot.js         headless-browser screenshots of the live viewer (Playwright, optional)
+  digest.js       planDigest() - a plan as one ASCII floor map per y layer. The blueprint both
+                  loops hand to the model; also the coordinator's few-shot example format
+  agent.js        single-agent build planning
+  providers.js    LLM abstraction (claude/gemini/openai/ollama) + vision (completeVision/
+                  supportsVision) + auto-detect + library fallback. extractClaudeText/
+                  extractOpenAIText are the truncation-vs-refusal decision, per provider
+  fill.js         fillRegion/fillPlan/clearForPlan - /fill caps at 32768 blocks and is refused
+                  SILENTLY above it, so the split lives here and everything clearing ground uses it
+  json.js         parseJsonish() - the one fence-tolerant JSON extractor for model replies
+  library/        procedural builds (13 presets: castle, wizard tower, cottage, lighthouse,
+                  windmill, pagoda, ship, desert temple, observatory, mushroom house,
+                  treehouse, hot-air balloon, rocket pad) used when no AI key is set
+  viewer.js       browser viewer (prismarine-viewer) with graceful fallback; viewerUrl()
+  viewer-hook.js  the three.js devtools handshake - the only way to reach the viewer's camera
+                  from outside its bundle. Injected by web.js (click-to-place + the viewer
+                  preloader's mesh-progress signal via __scenes) AND shot.js
+  camera.js       the stationary bot the viewer renders from (a moving one freezes chunks)
+  world.js        pacifyWorld() - peaceful, no mob griefing/fire/weather, no command-feedback spam
+  preflight.js    friendly checks (API key set, server reachable) before connecting
+  e2e-test.js     end-to-end smoke test (no API key needed)
+  crew-replay.js  full crew build from a cached plan (no API key)
+  index.js        interactive CLI
+  demo.js / multi-demo.js / offline-demo.js   demos
+  plans/          cached build plans (e.g. tavern.json)
+scripts/play.js     `npm run play` - the one command (server-up + build)
+scripts/web.js      `npm run web` - persistent-crew web control panel (http + SSE, embeds the viewer)
+scripts/record-demo.mjs  `npm run record` - drives a headless browser against a running panel and
+                    cuts the two-speed timelapse (build fast, reveal orbit slow). Camera is ORBITED,
+                    never panned/dollied mid-build, and it refuses to publish an unfinished build.
+scripts/server.js   start/stop/reset the Docker server (plain docker, no compose)
+scripts/setup.js    `npm run setup` onboarding helper
+scripts/gen-ops.js  `npm run ops` - generates docker/ops.json (offline UUIDs)
+docker-compose.yml  optional compose alternative to scripts/server.js
+docker/ops.json     prebuilt operator list (bots need op for /setblock)
+```
