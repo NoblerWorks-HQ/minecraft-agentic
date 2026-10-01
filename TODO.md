@@ -4,6 +4,13 @@ Working task list for **minecraft-agentic**. Read this at the start of a work se
 
 ---
 
+## Refactor audit (2026-10-01) - found, not started
+
+Read-only fleet audit (9 agents, nothing changed). Each line: effort S (<half day) / M (1-3 days) / L, and the risk of making the fix. 🔴 = a live bug or safety hole.
+
+- [ ] 🟡 `scripts/web.js` (1,701 lines; l.1133-1701 is one `PAGE` template string) -> `public/index.html` + `src/scene/`. M, low-med (`npm run record` uses it).
+- [ ] 🟡 Bump the `gpt-4o` / `llama3.1` defaults (`src/providers.js:25-26`, `.env.example`, `docs/SETUP.md:118,134`) after checking deprecations, as WarGames did 2026-09-17; recompress `docs/media` PNGs (4.6 MB). S, low.
+
 ## Open
 
 - [ ] Consider giving the critic more than one round (it currently critiques once and applies one patch). Worth it only if the single pass proves to help - measure before adding cost.
