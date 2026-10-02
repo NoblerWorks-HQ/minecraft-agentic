@@ -4,6 +4,18 @@ Working task list for **minecraft-agentic**. Read this at the start of a work se
 
 ---
 
+## Audit findings (2026-10-02)
+
+Fleet audit follow-up. Fixed items are on main 2026-10-02 (local tool, no deploy - push to publish).
+
+- [x] 2026-10-02 high - Offline-mode server published on 0.0.0.0 with pre-opped bot usernames (`scripts/server.js`, `docker-compose.yml:14`) - now `127.0.0.1:25565` (`MC_BIND` opts in).
+- [ ] 2026-10-02 Patrick: an EXISTING server container keeps its old 0.0.0.0 binding - run `npm run server:recreate` once (world is kept), then `docker ps` should show `127.0.0.1:25565->25565`.
+- [x] 2026-10-02 medium - Web panel listened on all interfaces; POST /build had no Origin/CSRF check (`scripts/web.js`) - binds 127.0.0.1 (`BIND` opts in), same-origin + loopback-Host check on every POST, `/build` needs JSON; `test/http-guard.test.mjs` in `npm test`.
+- [x] 2026-10-02 medium - In-game `!build` had no busy lock (`src/index.js`) - one build at a time.
+- [ ] medium - In-game `!build` still has no sender allowlist (`src/index.js`) - accept only `MC_OWNER`/listed names; needs a decision on the default (owner unknown in offline mode).
+- [ ] low - prismarine-viewer's own port (`VIEWER_PORT`, 3000) still listens on all interfaces (inside node_modules; read-only view) - bind it to 127.0.0.1 via `scripts/patch-viewer.js` if it matters.
+- [ ] medium - Per-session spend cap on model calls (audit improvement, effort M).
+
 ## Refactor audit (2026-10-01) - found, not started
 
 Read-only fleet audit (9 agents, nothing changed). Each line: effort S (<half day) / M (1-3 days) / L, and the risk of making the fix. 🔴 = a live bug or safety hole.
