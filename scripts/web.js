@@ -25,8 +25,11 @@ import { detectProvider, isLiveProvider, providerLabel, supportsVision } from '.
 import { listBuilds } from '../src/library/index.js';
 import { fillRegion as fill, fillPlan } from '../src/fill.js';
 import { Vec3 } from 'vec3';
+import { isAllowedRequest, isJsonContentType } from '../src/http-guard.js';
 
 const WEB_PORT = parseInt(process.env.WEB_PORT || '8080', 10);
+// Loopback only by default - the panel spends your model key. BIND=0.0.0.0 to open it to the LAN.
+const WEB_BIND = process.env.BIND || '127.0.0.1';
 // The viewer's port is internal - the page only ever talks to WEB_PORT and we
 // reverse-proxy /viewer/ to this. It's a `let` because if the preferred port is
 // taken (a stale process, a second panel), we roll to the next free one rather
@@ -934,6 +937,12 @@ function readBody(req) {
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${WEB_PORT}`);
 
+  // Every POST spends or changes something; only the panel's own page may send one.
+  if (req.method === 'POST' && !isAllowedRequest({ origin: req.headers.origin, host: req.headers.host, bind: WEB_BIND })) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'forbidden origin' }));
+  }
+
   if (url.pathname === '/viewer') { res.writeHead(302, { Location: '/viewer/' }); return res.end(); }
   if (url.pathname.startsWith('/viewer/')) return proxyToViewer(req, res);
 
@@ -965,6 +974,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/build') {
+    if (!isJsonContentType(req.headers['content-type'])) { res.writeHead(415, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ error: 'expected application/json' })); }
     const body = await readBody(req);
     let payload = {};
     try { payload = JSON.parse(body || '{}'); } catch { /* ignore */ }
@@ -1061,7 +1071,7 @@ async function main() {
       console.error(`  (Different port: WEB_PORT=8081 npm run web)\n`);
       process.exit(1);
     });
-    server.listen(WEB_PORT, resolve);
+    server.listen(WEB_PORT, WEB_BIND, resolve);
   });
   console.log('========================================================');
   console.log(`  OPENING IN YOUR BROWSER:  http://localhost:${WEB_PORT}`);

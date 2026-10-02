@@ -46,7 +46,7 @@
     "server:reset": "node scripts/server.js reset",
     "server:recreate": "node scripts/server.js recreate",
     "postinstall": "node scripts/patch-viewer.js",
-    "test": "node test/pick-ground.test.mjs && node test/agent-loops.test.mjs && node test/ops.test.mjs && node test/preset-audit.test.mjs && node scripts/patch-viewer.js --check",
+    "test": "node test/http-guard.test.mjs && node test/pick-ground.test.mjs && node test/agent-loops.test.mjs && node test/ops.test.mjs && node test/preset-audit.test.mjs && node scripts/patch-viewer.js --check",
     "test:presets": "node test/preset-audit.test.mjs",
     "test:loops": "node test/agent-loops.test.mjs",
     "test:ops": "node test/ops.test.mjs",

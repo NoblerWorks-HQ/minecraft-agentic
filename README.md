@@ -367,6 +367,8 @@ All via `.env` (copy from `.env.example`, or let `npm run setup` do it):
 | `MC_USERNAME` | `BuilderBot` | Single-agent bot name (re-op after changing: `npm run ops -- Name`) |
 | `MC_VERSION` | `1.20.1` | Server **and** bot version. Leave it - the viewer supports 1.20.1 exactly. |
 | `WEB_PORT` | `8080` | Control panel port (`npm run web`) |
+| `BIND` | `127.0.0.1` | Control panel listen address. `0.0.0.0` opens it to your LAN - anyone there can then spend your model key. |
+| `MC_BIND` | `127.0.0.1` | Host address the Minecraft server port is published on (`npm run server`). The server is offline-mode with the bots opped, so only widen this deliberately; takes effect on `npm run server:recreate`. |
 | `VIEWER_PORT` | `3000` | Browser viewer port (auto-rolls if taken) |
 | `VIEWER` | on | Set `off` to disable the browser viewer |
 | `NO_OPEN` | - | `1` = don't auto-open a browser (headless boxes) |

@@ -32,11 +32,15 @@ async function main() {
   console.log('Bot ready! Enter build prompts:\n');
 
   // Set up chat listener for in-game commands
+  let chatBuildBusy = false;
   bot.on('chat', async (username, message) => {
     if (username === bot.username) return;
 
     if (message.startsWith('!build ')) {
       const prompt = message.slice(7);
+      // One build at a time: each !build is a paid model call plus a /setblock stream.
+      if (chatBuildBusy) { bot.chat('Busy - finish or !stop the current build first.'); return; }
+      chatBuildBusy = true;
       console.log(`[Chat] ${username} requested: ${prompt}`);
       bot.chat(`On it! Building: ${prompt}`);
 
@@ -58,6 +62,8 @@ async function main() {
       } catch (err) {
         bot.chat(`Oops, something went wrong: ${err.message}`);
         console.error(err);
+      } finally {
+        chatBuildBusy = false;
       }
     }
 
