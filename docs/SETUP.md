@@ -169,7 +169,7 @@ mounted `ops.json` (ops the bots - see the notes below). Run it from the repo ro
 volume path resolves:
 
 ```bash
-docker run -d -p 25565:25565 \
+docker run -d -p 127.0.0.1:25565:25565 \
   -e EULA=TRUE -e ONLINE_MODE=FALSE -e ENABLE_COMMAND_BLOCK=TRUE \
   -e VERSION=1.20.1 \
   -e LEVEL_TYPE=FLAT \

@@ -107,7 +107,10 @@ export async function ensureServerUp() {
     sh([
       'docker run -d',
       `--name ${NAME}`,
-      `-p ${PORT}:25565`,
+      // Loopback only: the server is offline-mode with the bot names opped, so anyone who can
+      // reach it can join as BuilderBot with operator. Docker-published ports bypass host
+      // firewalls. MC_BIND=0.0.0.0 to expose it deliberately (then server:recreate).
+      `-p ${process.env.MC_BIND || '127.0.0.1'}:${PORT}:25565`,
       '-e EULA=TRUE -e ONLINE_MODE=FALSE -e ENABLE_COMMAND_BLOCK=TRUE',
       // Raised superflat - no caverns anywhere (see GENERATOR_SETTINGS above).
       `-e LEVEL_TYPE=FLAT -e 'GENERATOR_SETTINGS=${GENERATOR_SETTINGS}'`,
