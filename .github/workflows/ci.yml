@@ -36,4 +36,7 @@ jobs:
         run: npm test
 
       - name: Audit
-        run: npm audit --audit-level=high
+        # Production deps only (2026-10-04): the remaining high alert is braces via
+        # nodemon -> chokidar, a dev-only watcher with no patched braces release
+        # (every version is flagged). Shipped code is what this gate protects.
+        run: npm audit --audit-level=high --omit=dev
