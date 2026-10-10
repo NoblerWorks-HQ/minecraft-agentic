@@ -116,3 +116,6 @@ for custom prompts. In-game chat: `!build <description>`, `!stop`. Flags: `--seq
 ### ALWAYS
 - Keep `ANTHROPIC_API_KEY` in `.env` (gitignored).
 - Be mindful of token spend in `crew` mode (4 bots = more model calls).
+
+## Docs stay current
+- Update README, `docs/`, this CLAUDE.md and TODO.md **in the same commit** as the change that makes them wrong, never in a later cleanup. A stale doc is a bug.
