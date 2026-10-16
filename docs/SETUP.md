@@ -115,7 +115,7 @@ Claude Pro/Max chat subscription does **not** include API access; that's separat
    LLM_PROVIDER=openai
    OPENAI_API_KEY=sk-YOURKEYHERE
    ```
-5. Model defaults to `gpt-4o`; override with `OPENAI_MODEL=`.
+5. Model defaults to `gpt-6-luna` (OpenAI's named replacement for `gpt-4o`, which retires 2027-01-14); override with `OPENAI_MODEL=`. GPT-5+/o-series models run with `reasoning_effort: none` unless `OPENAI_REASONING_EFFORT` says otherwise.
 
 ### Run a local model with Ollama (free, no key, needs a GPU)
 

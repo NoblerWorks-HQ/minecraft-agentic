@@ -22,6 +22,10 @@
 // back in range), and always apply late geometry instead of stranding a hole. Memory stays
 // bounded: the scene plots are finite and a session revisits the same chunks.
 //
+// 3. "Listens on all interfaces": prismarine-viewer's http.listen(port) binds 0.0.0.0, so anyone
+// on the LAN could open the world view. Bound to 127.0.0.1 (2026-10-16); nothing here reaches it
+// from another host (src/viewer.js hands out 127.0.0.1 URLs).
+//
 // Patching the installed files is the only option: the browser loads the PREBUILT bundle,
 // so fixing the source alone changes nothing. Idempotent - safe to run any number of times.
 // Wired into `postinstall` (fresh installs) AND called from src/viewer.js at startup
@@ -88,6 +92,14 @@ export function patchViewer({ quiet = false } = {}) {
       from: /const (\w+)=(\w+)\.key\.split\(","\);if\(!this\.loadedChunks\[\1\[0\]\+","\+\1\[2\]\]\)return;/,
       to: '',
     },
+
+    // --- loopback bind (3): the viewer is a local read-only view, not a LAN service ---
+    {
+      label: 'bind viewer to 127.0.0.1',
+      file: path.join(pkgDir, 'lib/mineflayer.js'),
+      from: /http\.listen\(port, \(\) => \{/,
+      to: "http.listen(port, '127.0.0.1', () => {",
+    },
   ];
 
   let patched = 0;
@@ -123,6 +135,10 @@ export function checkViewer() {
       || /key\.split\(['"],['"]\);?\s*if ?\(!this\.loadedChunks\[/.test(src)) {
       bad.push(`${rel} (perimeter-pop)`);
     }
+  }
+  const mf = path.join(pkgDir, 'lib/mineflayer.js');
+  if (fs.existsSync(mf) && /http\.listen\(port, \(\) => \{/.test(fs.readFileSync(mf, 'utf8'))) {
+    bad.push('lib/mineflayer.js (viewer listens on all interfaces)');
   }
   return bad;
 }

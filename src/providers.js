@@ -22,7 +22,9 @@ const DEFAULT_MODELS = {
   // gemini-2.0-flash can carry a free-tier quota of 0 for some accounts/regions (429
   // "limit: 0"); the -latest alias is the reliably-free default. Override with GEMINI_MODEL.
   gemini: process.env.GEMINI_MODEL || 'gemini-flash-latest',
-  openai: process.env.OPENAI_MODEL || 'gpt-4o',
+  // gpt-6-luna: OpenAI's deprecations page (checked 2026-10-16) retires gpt-4o on 2027-01-14
+  // and names gpt-6-luna as the replacement. Vision + json_object are supported.
+  openai: process.env.OPENAI_MODEL || 'gpt-6-luna',
   ollama: process.env.OLLAMA_MODEL || 'llama3.1',
 };
 
@@ -301,6 +303,22 @@ async function completeGemini({ system, user, maxTokens, images = [] }) {
   );
 }
 
+/**
+ * GPT-5+/o-series reject `max_tokens` (they want `max_completion_tokens`) and spend that budget
+ * on reasoning unless told not to, so ask for reasoning_effort "none" (OPENAI_REASONING_EFFORT
+ * overrides; "minimal" for older GPT-5 models). Older models (gpt-4o, a custom OPENAI_MODEL)
+ * keep the classic `max_tokens`. Exported so `npm run test:loops` can pin it without a key.
+ */
+export function openaiTokenParams(model, maxTokens) {
+  if (/^(gpt-[5-9]|o\d)/.test(String(model))) {
+    return {
+      max_completion_tokens: maxTokens,
+      reasoning_effort: env('OPENAI_REASONING_EFFORT') || 'none',
+    };
+  }
+  return { max_tokens: maxTokens };
+}
+
 async function completeOpenAI({ system, user, maxTokens, images = [] }) {
   const mod = await import('openai').catch(() => {
     throw new Error('OpenAI support needs the openai package. Run: npm install');
@@ -317,7 +335,7 @@ async function completeOpenAI({ system, user, maxTokens, images = [] }) {
     : user;
   const res = await client.chat.completions.create({
     model: DEFAULT_MODELS.openai,
-    max_tokens: maxTokens,
+    ...openaiTokenParams(DEFAULT_MODELS.openai, maxTokens),
     response_format: { type: 'json_object' },
     messages: [
       { role: 'system', content: system },

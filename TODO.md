@@ -13,7 +13,7 @@ Fleet audit follow-up. Fixed items are on main 2026-10-02 (local tool, no deploy
 - [x] 2026-10-02 medium - Web panel listened on all interfaces; POST /build had no Origin/CSRF check (`scripts/web.js`) - binds 127.0.0.1 (`BIND` opts in), same-origin + loopback-Host check on every POST, `/build` needs JSON; `test/http-guard.test.mjs` in `npm test`.
 - [x] 2026-10-02 medium - In-game `!build` had no busy lock (`src/index.js`) - one build at a time.
 - [ ] medium - In-game `!build` still has no sender allowlist (`src/index.js`) - accept only `MC_OWNER`/listed names; needs a decision on the default (owner unknown in offline mode).
-- [ ] low - prismarine-viewer's own port (`VIEWER_PORT`, 3000) still listens on all interfaces (inside node_modules; read-only view) - bind it to 127.0.0.1 via `scripts/patch-viewer.js` if it matters.
+- [x] 2026-10-16 prismarine-viewer binds 127.0.0.1 (`scripts/patch-viewer.js` target 3 + `--check`, part of `npm test`; runs at viewer start and postinstall). Not exercised against a live Minecraft server.
 - [ ] medium - Per-session spend cap on model calls (audit improvement, effort M).
 
 ## Refactor audit (2026-10-01) - found, not started
@@ -21,7 +21,8 @@ Fleet audit follow-up. Fixed items are on main 2026-10-02 (local tool, no deploy
 Read-only fleet audit (9 agents, nothing changed). Each line: effort S (<half day) / M (1-3 days) / L, and the risk of making the fix. 🔴 = a live bug or safety hole.
 
 - [ ] 🟡 `scripts/web.js` (1,701 lines; l.1133-1701 is one `PAGE` template string) -> `public/index.html` + `src/scene/`. M, low-med (`npm run record` uses it).
-- [ ] 🟡 Bump the `gpt-4o` / `llama3.1` defaults (`src/providers.js:25-26`, `.env.example`, `docs/SETUP.md:118,134`) after checking deprecations, as WarGames did 2026-09-17; recompress `docs/media` PNGs (4.6 MB). S, low.
+- [x] 2026-10-16 OpenAI default `gpt-4o` -> `gpt-6-luna` (OpenAI deprecations page: gpt-4o retires 2027-01-14, gpt-6-luna is the named replacement; request now sends `max_completion_tokens` + `reasoning_effort: none` for GPT-5+/o-series, tested in `test/agent-loops.test.mjs`), in `src/providers.js`, `.env.example`, `docs/SETUP.md`. `llama3.1` kept: still on the Ollama library, no deprecation notice; a newer tag was not verified. `docs/media` PNGs 4.6 MB -> 1.4 MB (256-colour, eyeballed).
+- [ ] No turn has been played on `gpt-6-luna` (needs an OpenAI key): run one build with `LLM_PROVIDER=openai` and confirm the JSON plan parses.
 
 ## Open
 

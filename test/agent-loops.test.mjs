@@ -18,7 +18,7 @@ import { planDigest } from '../src/digest.js';
 import { normalizePatch, applyPatch, expectedBlocks, missingBlocks, POPS_OFF } from '../src/repair.js';
 import { pickExample } from '../src/coordinator.js';
 import { getLibraryPlan } from '../src/library/index.js';
-import { geminiModelIsUnavailable, GEMINI_FALLBACKS, extractClaudeText, extractOpenAIText } from '../src/providers.js';
+import { geminiModelIsUnavailable, GEMINI_FALLBACKS, extractClaudeText, extractOpenAIText, openaiTokenParams } from '../src/providers.js';
 import { fillPlan, FILL_CAP } from '../src/fill.js';
 import { parseJsonish } from '../src/json.js';
 
@@ -355,6 +355,13 @@ pass(covers(huge, 12, 20, 12) === 1 && covers(huge, -8, -4, -8) === 1 && covers(
 // and ten for something like a shore ring.
 pass(fillPlan(0, 0, 0, 2, 0, 288).length === 1, 'a long thin box stays a single command (split on volume, not on 32s)');
 pass(fillPlan(39, 48, 39, -8, -4, -8).length === huge.length, 'corners given backwards are normalized, not dropped');
+
+// OpenAI token params: GPT-5+/o-series reject max_tokens; older models still need it.
+pass(openaiTokenParams('gpt-6-luna', 100).max_completion_tokens === 100 && !('max_tokens' in openaiTokenParams('gpt-6-luna', 100)),
+  'gpt-6-luna gets max_completion_tokens, not max_tokens');
+pass(openaiTokenParams('gpt-6-luna', 100).reasoning_effort === 'none', 'gpt-6-luna defaults to reasoning_effort none');
+pass(openaiTokenParams('gpt-4o', 100).max_tokens === 100 && !('reasoning_effort' in openaiTokenParams('gpt-4o', 100)),
+  'gpt-4o (a pinned OPENAI_MODEL) keeps max_tokens and no reasoning_effort');
 
 console.log(failed ? `\n${failed} failure(s)` : '\nAll agent-loop checks passed.');
 process.exit(failed ? 1 : 0);
