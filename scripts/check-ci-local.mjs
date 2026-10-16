@@ -75,13 +75,18 @@
  * .ci-local.json keys:
  *   dirs              package directories (default ["."])
  *   skip              step keys to skip, bare ("test") or per dir ("backend:test")
- *   extraSteps        [{label, cmd, dir?, mode?, inputs?}] - cached only with `inputs`
+ *   extraSteps        [{label, cmd, dir?, mode?, inputs?, early?}] - cached only with `inputs`.
+ *                     `early: true` runs the step BEFORE every package lane and
+ *                     stops the gate when it fails - only for a step that reads
+ *                     tracked files alone (no build output). See "early" below.
  *   docsOnlyIgnore    regexes; a push touching only these skips the gate
  *   inputs            {"<dir>" | "<dir>:<key>": [paths]} - what a step READS.
  *                     Default is the whole repo. The step's own dir is always added.
  *   parallel          run package dirs side by side (default: only on a machine
  *                     with 16 GB or more - see "run" below for why)
  *   minFreeMBPerStep  free memory needed to start a step beside another (default 2048)
+ *   niceness          nice value the gate and every step run at (default 10, 0 disables) -
+ *                     keeps editors and dev servers responsive while a gate runs
  *   jestWorkers       workers for a `jest --runInBand` test script run BY THIS GATE
  *                     (default 2 on a machine with 7 GB or more, else 1). The
  *                     script itself is untouched - CI and deploys still run it
@@ -91,12 +96,22 @@
  * Bypass: `git push --no-verify`, or SKIP_LOCAL_CI=1.
  * Force the gate even when Actions is green: LOCAL_CI_FORCE=1.
  * Ignore the pass cache for one run: LOCAL_CI_NO_CACHE=1.
+ * Run every step even after an `early` step fails: LOCAL_CI_KEEP_GOING=1.
+ *
+ * THE MACHINE-WIDE GATE QUEUE (2026-10-15). At most LOCAL_CI_SLOTS (default 2)
+ * gates, across every repo and session on this machine, run their steps at once:
+ * each takes a `flock` on ~/.cache/local-ci/slot-<n>.lock before its first
+ * uncached non-early step and waits (no timeout) when all are held. The lock dies
+ * with the process, so a killed gate never wedges the queue. See "the gate queue"
+ * below. Emergency bypass: LOCAL_CI_NO_QUEUE=1. Every gate that reaches its steps
+ * appends one line to ~/.cache/local-ci/runs.jsonl (LOCAL_CI_QUEUE_DIR moves both;
+ * the tests use it).
  */
-import { readFileSync, existsSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync, appendFileSync, unlinkSync, rmSync, statSync } from 'node:fs';
 import { spawnSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { freemem, totalmem } from 'node:os';
-import { join, resolve, relative } from 'node:path';
+import { freemem, totalmem, loadavg, cpus, homedir, getPriority, setPriority, constants as osConstants } from 'node:os';
+import { join, resolve, relative, basename, dirname } from 'node:path';
 
 const ROOT = process.env.CI_LOCAL_ROOT || process.cwd();
 const C = process.stdout.isTTY
@@ -127,6 +142,7 @@ const inputsCfg   = cfg.inputs ?? {};
 const parallel    = cfg.parallel ?? (totalmem() >= 16 * 1024 ** 3);
 const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
 const jestWorkers = cfg.jestWorkers ?? (totalmem() >= 7 * 1024 ** 3 ? 2 : 1);
+const niceness    = Number.isInteger(cfg.niceness) ? cfg.niceness : 10;
 // Free memory a multi-worker jest run needs at the moment it starts; below this
 // the step runs the script as written (serial) rather than wait. Measured peaks
 // with two workers + workerIdleMemoryLimit=1GB: 1.5-2.6 GB (2026-09-13).
@@ -148,7 +164,8 @@ function hashOf(paths) {
   for (const p of paths.sort()) {
     if (!existsSync(p)) continue;
     found++;
-    h.update(p).update('\0');
+    // Repo-relative, never absolute (2026-10-13): an absolute path made every worktree's key differ.
+    h.update(relative(ROOT, p)).update('\0');
     try { h.update(readFileSync(p)); } catch { h.update('UNREADABLE'); }
     h.update('\0');
   }
@@ -574,7 +591,8 @@ for (const s of extraSteps) {
     cwd: resolve(ROOT, s.dir || '.'), mode: s.mode || 'block',
     // One lane for all extra steps, run after the package lanes finish: they
     // are hand-written, may assume order, and often read what a build wrote.
-    lane: '(extra)',
+    // An `early` step opts out of that: it promises to read tracked files only.
+    lane: s.early ? '(early)' : '(extra)',
     // Cached only when the manifest says what the command reads. `fleet parity`
     // reads sibling repos, so a tree hash of this one can never vouch for it.
     inputs: Array.isArray(s.inputs) ? [s.dir || '.', ...s.inputs] : null,
@@ -626,7 +644,20 @@ if (!steps.length) {
 // ⚠️ Ignored files are not inputs. A test that reads a gitignored `.env` is
 // keyed as if the file did not exist - the same blind spot the marker has.
 
-const CACHE_FILE = join(ROOT, '.local-ci-cache.json');
+// 🔴 ONE CACHE PER CLONE, not per checkout (2026-10-13). It lives in git's common dir, which every worktree of
+// a clone shares: sessions deploy from fresh worktrees under ~/.cache to stay clear of each other, and with a
+// per-checkout file each of those started empty and re-ran all 29 nobler-os steps (15-30 min a push). Keys are
+// tree hashes, so a pass recorded in one worktree is exactly as true in another. The old per-checkout file is
+// still read (merged in) so nothing already cached is lost.
+const COMMON_DIR = gitOut(['rev-parse', '--path-format=absolute', '--git-common-dir']);
+const LEGACY_CACHE_FILE = join(ROOT, '.local-ci-cache.json');
+const CACHE_FILE = COMMON_DIR ? join(COMMON_DIR, 'local-ci-cache.json') : LEGACY_CACHE_FILE;
+// Turbo's own per-package cache, shared the same way: a fresh worktree reuses every unchanged package's
+// test/coverage result instead of re-running all of them. Content-hashed, so sharing is safe. An explicit
+// TURBO_CACHE_DIR wins.
+if (COMMON_DIR && !process.env.TURBO_CACHE_DIR && existsSync(join(ROOT, 'turbo.json'))) {
+  process.env.TURBO_CACHE_DIR = join(COMMON_DIR, 'turbo-cache');
+}
 const CACHE_V = 1;
 const CACHE_KEEP = 400;
 const head = gitOut(['rev-parse', 'HEAD']);
@@ -638,8 +669,14 @@ const cacheOff =
 if (pushedSha && head && pushedSha !== head) {
   console.log(`${C.y}[local-ci] ⚠  pushing ${pushedSha.slice(0, 8)}, but the checkout is ${head.slice(0, 8)} - the gate tests the checkout.${C.n}`);
 }
-const cacheDoc = cacheOff ? null : readJson(CACHE_FILE);
-const cache = cacheDoc?.v === CACHE_V && cacheDoc.entries && typeof cacheDoc.entries === 'object' ? cacheDoc.entries : {};
+const cacheEntries = (file) => {
+  const doc = readJson(file);
+  return doc?.v === CACHE_V && doc.entries && typeof doc.entries === 'object' ? doc.entries : {};
+};
+const cache = cacheOff ? {} : {
+  ...(CACHE_FILE !== LEGACY_CACHE_FILE ? cacheEntries(LEGACY_CACHE_FILE) : {}),
+  ...cacheEntries(CACHE_FILE),
+};
 if (cacheOff) console.log(`${C.d}           pass cache off: ${cacheOff}${C.n}`);
 
 // Input paths are validated before anything runs: a typo'd path in .ci-local.json
@@ -693,6 +730,16 @@ function stepKey(s) {
 // grow to a minute later, and two of them thrashing swap is far slower than
 // running them one after the other. A repo on a big machine gets it for free;
 // `"parallel": true` in .ci-local.json opts in anywhere.
+//
+// 🔴 `early` STEPS RUN FIRST AND A FAILURE STOPS THE GATE (2026-10-15). nobler-os
+// pushed a TODO.md that was over its byte budget; the 0.1 s check that says so
+// sat behind the test suites and the coverage run, and the push failed after
+// 916 s. A step marked `early` (it reads tracked files only - never a build
+// output, which is why this is opt-in and extra steps otherwise run last) runs
+// alone, before any package lane, whatever `parallel` says; if one fails
+// (block mode), nothing else starts and every step not run is listed, so the
+// red run cannot be read as a full check. LOCAL_CI_KEEP_GOING=1 runs the rest
+// anyway. Steps that did pass are still written to the pass cache.
 const TAIL_BYTES = 256 * 1024;
 const HEARTBEAT_MS = 30_000;
 const STAGGER_MS = 20_000;
@@ -705,17 +752,202 @@ const running = new Set();
 let lastStart = 0;
 const t0 = Date.now();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The gate queue, CPU-aware admission and lower priority (added 2026-10-15)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WHY. Gates from different repos and sessions share one 10-core workstation and
+// never knew about each other: the only admission rule was free memory. The
+// 2026-10-15 audit of every gate's timings found that when gates overlapped,
+// steps ran a median 1.3-1.7x slower and 29-38 % of steps took more than twice
+// their own median (p90/median 2.4-4.6x), with load average ~40 on 10 cores.
+// Contention made every gate slower and flaked timing-sensitive tests. Three rules:
+//
+// 1. THE QUEUE. At most SLOTS gates run their steps at once, machine-wide. A gate
+//    takes `flock -n` on ~/.cache/local-ci/slot-<n>.lock, held by a tiny `flock ...
+//    cat` child whose stdin is a pipe from this process: when the gate exits - or
+//    is SIGKILLed, or OOM-killed - the pipe closes, `cat` sees EOF and the kernel
+//    drops the lock. No stale-lock cleanup exists because none is needed. The
+//    pipe is close-on-exec, so a step's grandchild (a daemon a test left behind)
+//    can never inherit and hold the slot. The holder writes slot-<n>.json (repo,
+//    pid, since) for the "waiting for gate slot" line. Without util-linux `flock`
+//    the gate falls back to slot-<n>.d directories whose owner pid is checked for
+//    liveness. Any other tool may join the queue with a bare
+//    `flock ~/.cache/local-ci/slot-<n>.lock <cmd>` (Hexcode's tools/test.sh).
+//    The slot is taken lazily - at the first step that is neither cached nor
+//    `early` - so a fully cached or docs-only push never waits, and released as
+//    soon as the steps finish. A nested gate (a step that runs another gate) sees
+//    LOCAL_CI_SLOT_HELD=1 and does not queue behind its own parent.
+// 2. CPU-AWARE ADMISSION. A step starts BESIDE another only when the 1-minute
+//    load average is under the core count, as well as the free-memory rule;
+//    otherwise it runs after the current one.
+// 3. LOWER PRIORITY. The gate raises its own nice value to `niceness` (default
+//    10) before any step starts; every step inherits it.
+//
+// And it measures: one JSON line per gate run in runs.jsonl (repo, sha, start,
+// wall seconds, outcome, per-step seconds, load and free memory at start, slot
+// wait), so the next audit reads numbers instead of reconstructing them.
+const QUEUE_DIR = process.env.LOCAL_CI_QUEUE_DIR || join(homedir(), '.cache', 'local-ci');
+const SLOTS = Math.max(1, parseInt(process.env.LOCAL_CI_SLOTS || '', 10) || 2);
+const NO_QUEUE = process.env.LOCAL_CI_NO_QUEUE === '1' ? 'LOCAL_CI_NO_QUEUE=1'
+  : process.env.LOCAL_CI_SLOT_HELD === '1' ? 'a gate running inside a gate that already holds a slot'
+  : null;
+const CPUS = cpus().length || 1;
+const REPO = COMMON_DIR && basename(COMMON_DIR) === '.git' ? basename(dirname(COMMON_DIR)) : basename(ROOT);
+const pidAlive = (pid) => {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+};
+
+/** Non-blocking flock on `file`: the holder child once locked, null when held elsewhere, 'noflock' without flock. */
+function tryFlock(file) {
+  return new Promise((res) => {
+    let settled = false;
+    const settle = (v) => { if (!settled) { settled = true; res(v); } };
+    let ch;
+    try {
+      ch = spawn('flock', ['-n', '-E', '75', file, 'sh', '-c', 'echo locked; exec cat >/dev/null'],
+        { stdio: ['pipe', 'pipe', 'ignore'] });
+    } catch { settle('noflock'); return; }
+    let out = '';
+    ch.stdout.on('data', (d) => { out += d; if (out.includes('locked')) settle(ch); });
+    ch.on('error', (e) => settle(e.code === 'ENOENT' ? 'noflock' : null));
+    ch.on('close', () => settle(null));
+  });
+}
+
+/** Fallback without flock: an atomic mkdir, reclaimed only from a dead (or never-written) owner. */
+function tryDirLock(n) {
+  const d = join(QUEUE_DIR, `slot-${n}.d`);
+  const take = () => { mkdirSync(d); writeFileSync(join(d, 'owner.json'), JSON.stringify({ pid: process.pid })); };
+  try { take(); } catch {
+    const owner = readJson(join(d, 'owner.json'));
+    if (owner && pidAlive(owner.pid)) return null;
+    // No owner file yet: a holder may be between mkdir and write. Give it 10 s.
+    if (!owner) { try { if (Date.now() - statSync(d).mtimeMs < 10_000) return null; } catch { return null; } }
+    try { rmSync(d, { recursive: true, force: true }); take(); } catch { return null; }
+  }
+  const release = () => { try { if (readJson(join(d, 'owner.json'))?.pid === process.pid) rmSync(d, { recursive: true, force: true }); } catch {} };
+  process.on('exit', release);
+  return { n, release };
+}
+
+function holders() {
+  const out = [];
+  for (let n = 1; n <= SLOTS; n++) {
+    const j = readJson(join(QUEUE_DIR, `slot-${n}.json`));
+    if (j && pidAlive(j.pid)) {
+      const t = new Date(j.since);
+      out.push(`${j.repo} pid ${j.pid}, since ${Number.isNaN(+t) ? '?' : t.toTimeString().slice(0, 8)}`);
+    } else {
+      out.push(`slot ${n}: a holder that left no note (e.g. a flock wrapper)`);
+    }
+  }
+  return out.join('; ');
+}
+
+let slot = null;      // { n, release }
+let slotWaitS = 0;
+let slotPromise = null;
+const ensureSlot = () => (slotPromise ??= acquireSlot());
+async function acquireSlot() {
+  if (NO_QUEUE) { console.log(`${C.y}  not queueing for a gate slot: ${NO_QUEUE}${C.n}`); return; }
+  try { mkdirSync(QUEUE_DIR, { recursive: true }); } catch (e) {
+    console.log(`${C.y}  cannot create ${QUEUE_DIR} (${e.code}) - running without the gate queue${C.n}`);
+    return;
+  }
+  const w0 = Date.now();
+  let said = false, useFlock = true;
+  for (;;) {
+    for (let n = 1; n <= SLOTS && !slot; n++) {
+      if (useFlock) {
+        const r = await tryFlock(join(QUEUE_DIR, `slot-${n}.lock`));
+        if (r === 'noflock') {
+          useFlock = false;
+          console.log(`${C.y}  flock not found (util-linux) - queueing on pid-checked lock directories instead${C.n}`);
+        } else if (r) {
+          r.unref(); r.stdin.unref?.(); r.stdout.unref?.();
+          slot = { n, release: () => { try { r.stdin.end(); } catch {} try { r.kill(); } catch {} } };
+        }
+      }
+      if (!useFlock && !slot) slot = tryDirLock(n);
+    }
+    if (slot) break;
+    if (!said) {
+      said = true;
+      console.log(`${C.y}  waiting for gate slot (held by ${holders()})${C.n}`);
+      console.log(`${C.d}  … ${SLOTS} gate(s) may run at once machine-wide (LOCAL_CI_SLOTS); LOCAL_CI_NO_QUEUE=1 bypasses in an emergency${C.n}`);
+    }
+    await sleep(2000);
+  }
+  slotWaitS = +((Date.now() - w0) / 1000).toFixed(1);
+  process.env.LOCAL_CI_SLOT_HELD = '1'; // steps inherit it; a nested gate must not queue behind us
+  try {
+    writeFileSync(join(QUEUE_DIR, `slot-${slot.n}.json`),
+      JSON.stringify({ repo: REPO, pid: process.pid, sha: head, since: new Date().toISOString() }) + '\n');
+  } catch {}
+  if (said) console.log(`${C.c}  got gate slot ${slot.n} after ${secs(slotWaitS * 1000)}s${C.n}`);
+}
+function releaseSlot() {
+  if (!slot) return;
+  const note = join(QUEUE_DIR, `slot-${slot.n}.json`);
+  try { if (readJson(note)?.pid === process.pid) unlinkSync(note); } catch {}
+  slot.release();
+  slot = null;
+}
+
+let appliedNice = 0;
+if (niceness > 0) {
+  try {
+    const cur = getPriority(0);
+    if (cur < niceness) setPriority(0, niceness);
+    appliedNice = getPriority(0);
+  } catch { /* never fail a gate over its priority */ }
+}
+const startLoad = +loadavg()[0].toFixed(2);
+const startFreeMB = Math.round(freemem() / 1048576);
+
+let recorded = false;
+function recordRun(outcome) {
+  if (recorded) return;
+  recorded = true;
+  try {
+    mkdirSync(QUEUE_DIR, { recursive: true });
+    appendFileSync(join(QUEUE_DIR, 'runs.jsonl'), JSON.stringify({
+      v: 1, repo: REPO, root: ROOT, sha: head || null,
+      start: new Date(t0).toISOString(), wallS: +((Date.now() - t0) / 1000).toFixed(1), outcome,
+      steps: Object.fromEntries([...results].map(([l, r]) => [l, { s: r.ms != null ? +(r.ms / 1000).toFixed(1) : r.seconds, state: r.state }])),
+      running: [...running].map((r) => r.label),
+      load1: startLoad, cpus: CPUS, freeMB: startFreeMB,
+      slotWaitS, slot: slot?.n ?? null, slots: NO_QUEUE ? 0 : SLOTS, niceness: appliedNice,
+    }) + '\n');
+  } catch { /* bookkeeping never fails a gate */ }
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => {
+    for (const r of running) { try { r.child?.kill(sig); } catch {} }
+    recordRun('killed');
+    releaseSlot();
+    process.exit(128 + (osConstants.signals[sig] || 1));
+  });
+}
+
+
 function printResult(label, text) {
   console.log(`  ${label.padEnd(30)}${text}`);
 }
 
+// A step starts beside another only with free memory AND spare CPU (load under the core count, 2026-10-15).
 async function memoryTurn() {
   for (let waitedMs = 0; ; waitedMs += 2000) {
     if (running.size === 0) return;
     const freeMB = freemem() / 1048576;
-    if (freeMB >= minFreeMB && Date.now() - lastStart >= STAGGER_MS) return;
+    const load = loadavg()[0];
+    if (freeMB >= minFreeMB && load < CPUS && Date.now() - lastStart >= STAGGER_MS) return;
     if (waitedMs === 10_000) {
-      console.log(`${C.d}  … waiting for memory to start the next step (${freeMB.toFixed(0)} MB free, need ${minFreeMB})${C.n}`);
+      const why = [freeMB < minFreeMB && `${freeMB.toFixed(0)} MB free, need ${minFreeMB}`,
+        load >= CPUS && `load ${load.toFixed(1)} on ${CPUS} cores`].filter(Boolean).join('; ') || 'staggering starts';
+      console.log(`${C.d}  … waiting to start the next step beside the current one (${why})${C.n}`);
     }
     await sleep(2000);
   }
@@ -724,7 +956,7 @@ async function memoryTurn() {
 function runStep(s, key) {
   return new Promise((done) => {
     const st = Date.now();
-    const entry = { label: s.label, st };
+    const entry = { label: s.label, st, child: null };
     running.add(entry);
     lastStart = st;
     let tail = '';
@@ -750,6 +982,7 @@ function runStep(s, key) {
       // ESLint?" and rendered an arrow-key menu into the captured output.
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    entry.child = child;
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
     const finish = (code, err, signal) => {
@@ -786,6 +1019,8 @@ function runStep(s, key) {
         results.set(s.label, { state: 'fail', seconds: +dt });
         console.log(tail.trimEnd().split('\n').slice(-25).map((l) => `      ${l}`).join('\n'));
       }
+      const r = results.get(s.label);
+      if (r) r.ms = ms;
       done();
     };
     child.on('error', (err) => finish(null, err, null));
@@ -803,6 +1038,7 @@ async function runLane(queue) {
       results.set(s.label, { state: 'cached', seconds: 0, saved: hit.seconds });
       continue;
     }
+    if (s.lane !== '(early)') await ensureSlot();
     await memoryTurn();
     await runStep(s, key);
   }
@@ -810,13 +1046,14 @@ async function runLane(queue) {
 
 const lanes = new Map();
 for (const s of steps) {
-  const lane = parallel ? s.lane : 'serial';
+  const lane = s.lane === '(early)' ? '(early)' : parallel ? s.lane : 'serial';
   if (!lanes.has(lane)) lanes.set(lane, []);
   lanes.get(lane).push(s);
 }
-const packageLanes = [...lanes].filter(([k]) => k !== '(extra)').map(([, q]) => q);
+const packageLanes = [...lanes].filter(([k]) => k !== '(extra)' && k !== '(early)').map(([, q]) => q);
 const extraLane = lanes.get('(extra)');
-console.log(`${C.d}           ${steps.length} steps, ${parallel ? `${packageLanes.length} package lane(s) side by side, extra steps after` : 'one at a time'}${C.n}`);
+const earlyLane = lanes.get('(early)');
+console.log(`${C.d}           ${steps.length} steps, ${earlyLane ? `${earlyLane.length} early check(s) first, then ` : ''}${parallel ? `${packageLanes.length} package lane(s) side by side, extra steps after` : 'one at a time'}${C.n}`);
 console.log('');
 
 // A long silent step is indistinguishable from a hung one. Say what is running.
@@ -824,19 +1061,30 @@ const heartbeat = setInterval(() => {
   const long = [...running].filter((r) => Date.now() - r.st >= 20_000);
   if (long.length) console.log(`${C.d}  … running: ${long.map((r) => `${r.label} ${secs(Date.now() - r.st)}s`).join(', ')}${C.n}`);
 }, HEARTBEAT_MS);
-await Promise.all(packageLanes.map(runLane));
-if (extraLane) await runLane(extraLane);
+let notRun = [];
+if (earlyLane) await runLane(earlyLane);
+if (earlyLane && failed.length && process.env.LOCAL_CI_KEEP_GOING !== '1') {
+  notRun = steps.filter((s) => !results.has(s.label)).map((s) => s.label);
+  console.log(`${C.y}  an early check failed - not starting the other ${notRun.length} step(s)${C.n}`);
+} else {
+  await Promise.all(packageLanes.map(runLane));
+  if (extraLane) await runLane(extraLane);
+}
 clearInterval(heartbeat);
+recordRun(failed.length === 0 ? 'pass'
+  : [...results.values()].some((r) => r.state === 'fail') ? 'fail' : 'unchecked');
+releaseSlot();
 
 // Persist what passed, even when something else failed: a passing step's
 // result is still true for its inputs, and the fix-and-re-push loop is exactly
 // when re-running it hurts most.
 if (!cacheOff) {
   try {
-    const entries = Object.entries(cache)
+    // Re-read before writing: another worktree's gate may have added entries since this one started.
+    const entries = Object.entries({ ...cacheEntries(CACHE_FILE), ...cache })
       .sort(([, a], [, b]) => String(b.at).localeCompare(String(a.at)))
       .slice(0, CACHE_KEEP);
-    const tmp = `${CACHE_FILE}.tmp`;
+    const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify({ v: CACHE_V, entries: Object.fromEntries(entries) }, null, 1) + '\n');
     renameSync(tmp, CACHE_FILE);
   } catch {
@@ -903,6 +1151,7 @@ for (const [label, r] of results) {
 if (warned.length) console.log(`${C.y}[local-ci] warnings (not blocking): ${warned.join(', ')}${C.n}`);
 if (failed.length) {
   console.log(`${C.r}[local-ci] FAILED in ${total}s: ${failed.join(', ')}${C.n}`);
+  if (notRun.length) console.log(`${C.y}           NOT RUN (an early check failed first): ${notRun.join(', ')} - LOCAL_CI_KEEP_GOING=1 runs them anyway${C.n}`);
   console.log(`${C.y}           Push blocked. Fix, or bypass with: git push --no-verify${C.n}`);
   process.exit(1);
 }
