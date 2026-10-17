@@ -13,15 +13,15 @@ set -uo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 Z="0000000000000000000000000000000000000000"
 
-range=""
-pushed=""
-rref=""
+# EVERY pushed ref is gated, not just the first: `git push origin a b` or `--all`
+# used to run the gate for the first ref only and let the rest through unchecked.
+# A ref whose sha was already gated in this push is not run twice.
+refs=()
 while read -r _lref lsha _rref rsha; do
     [ "$lsha" = "$Z" ] && continue                 # branch deletion, nothing to check
-    pushed="$lsha"
-    rref="$_rref"
-    [ "$rsha" = "$Z" ] || range="${rsha}..${lsha}" # new branch => empty => check everything
-    break
+    r=""
+    [ "$rsha" = "$Z" ] || r="${rsha}..${lsha}"     # new branch => empty => check everything
+    refs+=("${r}|${lsha}|${_rref}")
 done
 
 command -v node >/dev/null 2>&1 || {
@@ -30,4 +30,16 @@ command -v node >/dev/null 2>&1 || {
 # The pushed sha lets the gate refuse its pass cache when the commit being
 # pushed is not the checkout it is about to test. The remote ref is the branch
 # GitHub will see: the gate stands down only if ci.yml runs on a push to it.
-exec node "$ROOT/scripts/check-ci-local.mjs" "$range" "$pushed" "$rref"
+# A push that only deletes refs has nothing to gate by ref; keep the old behaviour of
+# one gate run with no arguments.
+[ "${#refs[@]}" -eq 0 ] && refs=("||")
+seen=" "
+for entry in "${refs[@]}"; do
+    IFS='|' read -r range pushed rref <<<"$entry"
+    if [ -n "$pushed" ]; then
+        case "$seen" in *" $pushed "*) continue ;; esac
+        seen="$seen$pushed "
+    fi
+    node "$ROOT/scripts/check-ci-local.mjs" "$range" "$pushed" "$rref" || exit $?
+done
+exit 0
