@@ -532,3 +532,42 @@ library preset (see [`src/library/index.js`](src/library/index.js) - the primiti
 easy), a new scene, a new personality, a new provider. Start with
 [CONTRIBUTING.md](CONTRIBUTING.md) (setup, which tests to run for which change) and report
 vulnerabilities via [SECURITY.md](SECURITY.md). [MIT licensed](LICENSE).
+
+<!-- nobler-footer:start - shared block, kept in sync across Nobler Works public repos -->
+
+---
+
+<div align="center" markdown="1">
+
+## More from Nobler Works
+
+Free, open-source projects from the [Nobler Works](https://noblerworks.com/) team. If one helps you, a ⭐ helps the next person find it.
+
+</div>
+
+| Project | What it is | |
+|---|---|---|
+| 🛰️ **[IRONSIGHT](https://github.com/NoblerWorks-HQ/IRONSIGHT)** | Real-time OSINT command center - 50+ live intel feeds, no API keys | **[Website →](https://noblerworks-hq.github.io/IRONSIGHT/)** |
+| 🌍 **[War Games](https://github.com/NoblerWorks-HQ/WarGames)** | NATO, Russia, and China on one map, each commanded by an LLM | **[Website →](https://noblerworks-hq.github.io/WarGames/)** |
+| 📚 **[Everything AI, Summarized](https://github.com/PatrickWiloak/genai-research-papers-summarized)** | 156 landmark AI papers and 31 explainers in plain language | **[Website →](https://patrickwiloak.github.io/genai-research-papers-summarized/)** |
+| ☁️ **[Cloud, Data, AI & Security: Zero to Hero](https://github.com/PatrickWiloak/cloud-data-ai-security-zero-to-hero)** | 149 cert study guides across 27 providers, plus hands-on builds | **[Website →](https://patrickwiloak.github.io/cloud-data-ai-security-zero-to-hero/)** |
+| 🧠 **[Bedrock RAG with S3 Vectors](https://github.com/PatrickWiloak/bedrock-rag-s3-vectors-tutorial)** | Deploy document Q&A on AWS Bedrock in under 10 minutes (CDK or Terraform) | [Repo →](https://github.com/PatrickWiloak/bedrock-rag-s3-vectors-tutorial) |
+| 🏃 **[Proper Training for Distance Running](https://github.com/PatrickWiloak/proper-distance-running-training-guidance)** | Evidence-based running guide with twelve 5K-to-marathon plans | **[Read online →](https://achilles.fit/guides)** |
+
+<div align="center" markdown="1">
+
+**Our products:** [gitGood.dev](https://gitgood.dev) - train for the tech role, not just the interview · [Achilles.fit](https://achilles.fit) - adaptive training plans with an AI coach
+
+**Follow Nobler Works**
+
+[![Website](https://img.shields.io/badge/Website-000000?style=for-the-badge&logo=googlechrome&logoColor=white)](https://noblerworks.com/) [![X](https://img.shields.io/badge/X-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/Nobler_Works) [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://www.youtube.com/@NoblerWorks) [![TikTok](https://img.shields.io/badge/TikTok-000000?style=for-the-badge&logo=tiktok&logoColor=white)](https://www.tiktok.com/@noblerworks) [![Threads](https://img.shields.io/badge/Threads-000000?style=for-the-badge&logo=threads&logoColor=white)](https://www.threads.com/@noblerworks)
+
+**Follow Patrick Wiloak**, founder
+
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/in/patricklukewilson) [![X](https://img.shields.io/badge/X-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/PatrickWiloak) [![YouTube](https://img.shields.io/badge/YouTube-FF0000?style=for-the-badge&logo=youtube&logoColor=white)](https://youtube.com/@patrickwiloak) [![Instagram](https://img.shields.io/badge/Instagram-E4405F?style=for-the-badge&logo=instagram&logoColor=white)](https://instagram.com/patrickwiloak) [![Portfolio](https://img.shields.io/badge/Portfolio-000000?style=for-the-badge&logo=googlechrome&logoColor=white)](https://patricklukewilson.com)
+
+**Need something like this built for your domain? [Get in touch →](https://noblerworks.com/)**
+
+</div>
+
+<!-- nobler-footer:end -->
