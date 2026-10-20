@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Keeps TODO.md under its byte ceiling at COMMIT time. GENERATED - canonical source is
+# engineering-standards/scripts/templates/pre-commit; the logic lives in scripts/todo-budget.mjs
+# (also stamped) and the per-repo numbers in .ci-local.json "todoBudget".
+#
+# PRE-COMMIT, unlike the gate, on purpose: the pre-push gate skips a docs-only push entirely
+# ("docs-only push - skipping"), and TODO.md growth is almost always a docs-only commit. So the
+# size check has to run where every TODO.md change passes. It is cheap (<0.2 s) and does
+# nothing at all unless TODO.md is staged.
+#
+# Staged TODO.md over the ceiling:
+#   - archiving closed sections/items alone gets it under -> the hook does it and re-stages
+#     TODO.md + the quarter's archive (only when TODO.md has no unstaged changes);
+#   - otherwise it refuses, with the exact commands. Never bypass it with --no-verify.
+set -uo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+
+git diff --cached --name-only --diff-filter=ACMR -- TODO.md | grep -qx 'TODO.md' || exit 0
+
+command -v node >/dev/null 2>&1 || {
+    echo "[todo-budget] UNCHECKED: node not on PATH - refusing the commit (TODO.md is staged)." >&2; exit 1; }
+[ -f "$ROOT/scripts/todo-budget.mjs" ] || {
+    echo "[todo-budget] UNCHECKED: .githooks/pre-commit is installed but scripts/todo-budget.mjs is missing." >&2
+    echo "  Stamp it: cp ~/coding/engineering-standards/scripts/templates/todo-budget.mjs scripts/" >&2
+    exit 1; }
+
+cd "$ROOT" && node scripts/todo-budget.mjs --staged
