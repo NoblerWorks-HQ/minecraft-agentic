@@ -8,8 +8,7 @@ Working task list for **minecraft-agentic**. Read this at the start of a work se
 
 - *Context archived 2026-10-20: [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#audit-findings-2026-10-02)*
 
-- *4 closed items archived (last 2026-10-20): [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#audit-findings-2026-10-02)*
-- [x] ✅ 2026-10-28 already recreated: `docker inspect` shows 127.0.0.1:25565. 2026-10-02 Patrick: an EXISTING server container keeps its old 0.0.0.0 binding - run `npm run server:recreate` once (world is kept), then `docker ps` should show `127.0.0.1:25565->25565`.
+- *5 closed items archived (last 2026-10-28): [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#audit-findings-2026-10-02)*
 - [ ] medium - In-game `!build` still has no sender allowlist (`src/index.js`) - accept only `MC_OWNER`/listed names; needs a decision on the default (owner unknown in offline mode).
 - [ ] medium - Per-session spend cap on model calls (audit improvement, effort M).
 

@@ -23,6 +23,8 @@
 
 Fleet audit follow-up. Fixed items are on main 2026-10-02 (local tool, no deploy - push to publish).
 
+- [x] ✅ 2026-10-28 already recreated: `docker inspect` shows 127.0.0.1:25565. 2026-10-02 Patrick: an EXISTING server container keeps its old 0.0.0.0 binding - run `npm run server:recreate` once (world is kept), then `docker ps` should show `127.0.0.1:25565->25565`.
+
 <a id="refactor-audit-2026-10-01-found-not-started"></a>
 
 ## Refactor audit (2026-10-01) - found, not started
