@@ -96,8 +96,8 @@ npm run record         # timelapse from a RUNNING `npm run web` (needs ffmpeg + 
                        #   README hero media stays SCREENSHOTS (docs/media/crew-*.png) - footage reads worse
 
 npm run setup          # onboarding: creates .env, checks Node/Docker/server
-npm run demo "a castle" # single-agent build (uses your AI key, or the library if none)
-npm run offline        # offline demo (no Docker / no key)
+npm run demo "a castle" # single-agent build (needs your AI key; stops without one)
+npm run offline        # cached plan from src/plans/, no AI key (still needs the Minecraft server)
 ```
 No key -> `src/library/` procedural builds; set GEMINI/ANTHROPIC/OPENAI key (or `LLM_PROVIDER=ollama`)
 for custom prompts. In-game chat: `!build <description>`, `!stop`. Flags: `--sequential`, `--no-viewer`.

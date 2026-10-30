@@ -392,9 +392,9 @@ npm run web              # browser control panel at http://localhost:8080 (promp
 npm run play             # terminal menu: server up + crew build, viewer at :3000
 npm run play "a castle"  # skip the menu, build this (AI with a key, closest preset without)
 
-npm run demo "a hut"     # single bot instead of the crew
+npm run demo "a hut"     # single bot instead of the crew (needs an AI key)
 npm start                # interactive CLI - prompt after prompt (also !build/!stop in chat)
-npm run offline          # no Docker, no key - prints a sample plan
+npm run offline          # no AI key - builds a cached plan from src/plans/ (needs the Minecraft server)
 
 npm run server           # start the Minecraft server (plain docker, no compose needed)
 npm run server:stop      # stop it (world kept)
@@ -471,7 +471,8 @@ scripts/
 test/             pick-ground / agent-loops / ops / preset-audit / viewer-sync
 ```
 
-More depth: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how a prompt becomes a building),
+More depth: [docs/FEATURES.md](docs/FEATURES.md) (every user-visible feature),
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how a prompt becomes a building),
 [CLAUDE.md](CLAUDE.md) (invariants + hard-won gotchas), [docs/SETUP.md](docs/SETUP.md)
 (setup + troubleshooting). Want to contribute? [CONTRIBUTING.md](CONTRIBUTING.md).
 
