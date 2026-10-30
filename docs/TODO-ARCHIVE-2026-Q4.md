@@ -25,6 +25,14 @@ Fleet audit follow-up. Fixed items are on main 2026-10-02 (local tool, no deploy
 
 - [x] ✅ 2026-10-28 already recreated: `docker inspect` shows 127.0.0.1:25565. 2026-10-02 Patrick: an EXISTING server container keeps its old 0.0.0.0 binding - run `npm run server:recreate` once (world is kept), then `docker ps` should show `127.0.0.1:25565->25565`.
 
+*Whole section lifted from `TODO.md` 2026-10-30; nothing in it was open.*
+
+
+- *Context archived 2026-10-20: [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#audit-findings-2026-10-02)*
+
+- *5 closed items archived (last 2026-10-28): [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#audit-findings-2026-10-02)*
+- *2 undated items moved to the backlog (last 2026-10-30): [BACKLOG.md](BACKLOG.md#audit-findings-2026-10-02)*
+
 <a id="refactor-audit-2026-10-01-found-not-started"></a>
 
 ## Refactor audit (2026-10-01) - found, not started
@@ -34,6 +42,14 @@ Fleet audit follow-up. Fixed items are on main 2026-10-02 (local tool, no deploy
 *Section context lifted from `TODO.md` 2026-10-20; the section's open items stay there.*
 
 Read-only fleet audit (9 agents, nothing changed). Each line: effort S (<half day) / M (1-3 days) / L, and the risk of making the fix. 🔴 = a live bug or safety hole.
+
+*Whole section lifted from `TODO.md` 2026-10-30; nothing in it was open.*
+
+
+- *Context archived 2026-10-20: [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#refactor-audit-2026-10-01-found-not-started)*
+
+- *2 undated items moved to the backlog (last 2026-10-30): [BACKLOG.md](BACKLOG.md#refactor-audit-2026-10-01-found-not-started)*
+- *1 closed item archived (last 2026-10-20): [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#refactor-audit-2026-10-01-found-not-started)*
 
 <a id="open"></a>
 
@@ -50,6 +66,12 @@ Read-only fleet audit (9 agents, nothing changed). Each line: effort S (<half da
       that is unambiguous for a plane and cannot run away. Cheap, and it recovers real windows.
 
 - [x] ~~The critic gives a score, so build quality is now a number we can move. Next lever if it's wanted: the model still places some loose decoration in mid-air via `put` (glass/lanterns on nothing). A support check on decorator `put` ops, or a second critic round, would catch it.~~ ✅ 2026-09-18 support check in `expandOps` (`src/ops.js`): after every op lands, a decorator `put` is kept only if it stands on the ground (y <= 0) or touches a placed block on any face (support propagates through other puts, so chain + lantern works; order-independent); floating ones are dropped and reported in `dropped`. The `put` op doc (and so the generated prompt) now says so. 11 new checks in `test/ops.test.mjs`, incl. the worked example losing nothing; `npm test` green. Not deployed - ships with the next release/`npm start`.
+
+*Whole section lifted from `TODO.md` 2026-10-30; nothing in it was open.*
+
+
+- *9 undated items moved to the backlog (last 2026-10-30): [BACKLOG.md](BACKLOG.md#open)*
+- *2 closed items archived (last 2026-10-20): [docs/TODO-ARCHIVE-2026-Q4.md](docs/TODO-ARCHIVE-2026-Q4.md#open)*
 
 <a id="done"></a>
 

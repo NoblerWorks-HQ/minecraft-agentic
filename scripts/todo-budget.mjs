@@ -9,6 +9,7 @@
  *   node scripts/todo-budget.mjs --write             # move closed work into the quarter's archive
  *   node scripts/todo-budget.mjs --compact --write   # also move history tails off long open lines
  *   node scripts/todo-budget.mjs --prose --write     # also move open sections' older context (implies --compact)
+ *   node scripts/todo-budget.mjs --backlog --write   # also move stale UNDATED open items to BACKLOG.md
  *   node scripts/todo-budget.mjs --check             # gate: exit 1 over the ceiling (or another budget)
  *   node scripts/todo-budget.mjs --staged            # pre-commit: check the STAGED TODO.md; auto-archive + re-stage
  *   --root <repo> reads another checkout; --out <dir> writes TODO.md + archive there instead (dry runs)
@@ -61,6 +62,9 @@ export const DEFAULTS = {
   otherBudgets: {},
   keepSections: [],
   protectJson: [],
+  backlogFile: 'BACKLOG.md',
+  backlogAfterDays: 14,
+  backlogKeep: ['Patrick', '🔴', 'not deployed', 'NOT DEPLOYED', 'not applied', 'NOT APPLIED'],
 };
 const KEEP_MARK = '<!-- todo-budget: keep -->';
 
@@ -266,6 +270,162 @@ export function plan(todoText, today, cfg = DEFAULTS, archiveFile = archiveName(
     kept.push(sec.heading, ...collapseBlanks(out));
   }
   return { todo: collapseRules(kept.join('\n')), entries, stats };
+}
+
+// ─── backlog (undated, stale open items) ────────────────────────────────────
+
+/** The pointer an emptied-out section keeps. Generated, so verify treats it as trivial. */
+/** parse.py's DUE rule: a date after judge/by/before/due/re-check/revisit/until is a due date. */
+const MIDLINE_DUE_RE = /\b(?:judge[sd]?|by|before|due|re-check|revisit|until)\b\W{0,4}(?:on\s+)?20\d\d-\d\d-\d\d/i;
+
+export const BACKLOG_STUB_RE = /^- \*(\d+) undated items? moved to the backlog \(last (\d{4}-\d\d-\d\d)\): \[([^\]]+)\]\(([^)#]+)#([^)]+)\)\*$/;
+
+/**
+ * Should this open item block go to BACKLOG.md? Only when NOTHING makes it current:
+ * no leading date, no judge id, no keep word (Patrick's actions, 🔴, built-not-deployed),
+ * not in a pinned section, and no date in the item or its section heading newer than
+ * backlogAfterDays (an item with no date anywhere counts as old).
+ */
+export function backlogEligible(block, heading, today, cfg) {
+  const first = block.lines[0];
+  if (!OPEN_RE.test(first) || block.stub) return false;
+  if (leadingDate(first)) return false;
+  const text = block.lines.join('\n');
+  if (judgeIds(text).size) return false;
+  // The fleet ledger (parse.py DUE) also reads a mid-line due date; and 🔁 items recur.
+  if (MIDLINE_DUE_RE.test(text) || text.includes('🔁')) return false;
+  if ((cfg.backlogKeep || []).some((w) => text.includes(w))) return false;
+  const d = newestDate(`${heading}\n${text}`);
+  return !d || (today - d) / 86_400_000 > cfg.backlogAfterDays;
+}
+
+export function newBacklog() {
+  return [
+    '# Backlog',
+    '',
+    '> Open items with no date and no owner action, moved out of `TODO.md` by `scripts/todo-budget.mjs --backlog`',
+    '> once they were older than the repo\'s `backlogAfterDays`. **Still open, not archived.** Not read at session',
+    '> start and has no byte budget. Give an item a leading `YYYY-MM-DD` (or move it by hand) and the next run puts',
+    '> it back in `TODO.md`. Fleet design: engineering-standards `repo-and-project-structure.md` "TODO.md budget".',
+    '',
+    '---',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Move stale undated open items TODO.md -> BACKLOG.md (grouped under their section heading),
+ * and dated ones BACKLOG.md -> TODO.md. A section that loses items keeps one merged pointer.
+ * @returns {{ todo, backlog, moved, restored }}
+ */
+export function planBacklog(todoText, backlogText, today, cfg = DEFAULTS) {
+  const file = cfg.backlogFile || 'BACKLOG.md';
+  const { preamble, sections } = splitSections(todoText);
+  const kept = [...preamble];
+  const entries = [];
+  let moved = 0;
+  for (const sec of sections) {
+    if (pinned(sec, cfg)) { kept.push(sec.heading, ...sec.body); continue; }
+    const slug = slugify(sec.heading);
+    const bs = blocks(sec.body);
+    const going = bs.filter((b) => b.kind === 'item' && backlogEligible(b, sec.heading, today, cfg));
+    const old = bs.filter((b) => b.kind === 'item' && BACKLOG_STUB_RE.test(b.lines[0]));
+    let n = going.length;
+    let last = going.length ? iso(today) : '';
+    for (const o of old) { const m = BACKLOG_STUB_RE.exec(o.lines[0]); n += Number(m[1]); if (m[2] > last) last = m[2]; }
+    const stub = n ? `- *${n} undated item${n === 1 ? '' : 's'} moved to the backlog (last ${last}): [${file}](${file}#${slug})*` : null;
+    const out = [];
+    let stubbed = false;
+    for (const b of bs) {
+      if (going.includes(b) || old.includes(b)) {
+        if (stub && !stubbed) { out.push(stub); stubbed = true; }
+        continue;
+      }
+      out.push(...b.lines);
+    }
+    if (going.length) {
+      entries.push({ anchor: slug, heading: sec.heading, lines: going.flatMap((b) => [...b.lines, '']) });
+      moved += going.length;
+    }
+    kept.push(sec.heading, ...collapseBlanks(out));
+  }
+  let todo = collapseRules(kept.join('\n'));
+
+  // Back the other way: a backlog item that now has a leading date is current again.
+  let backlog = backlogText ?? newBacklog();
+  let restored = 0;
+  if (backlogText) {
+    const bl = splitSections(backlogText);
+    const keptB = [...bl.preamble];
+    const back = [];
+    for (const sec of bl.sections) {
+      const bs = blocks(sec.body);
+      const returning = bs.filter((b) => b.kind === 'item' && OPEN_RE.test(b.lines[0]) && leadingDate(b.lines[0]));
+      if (returning.length) back.push({ heading: sec.heading, lines: returning.flatMap((b) => b.lines) });
+      restored += returning.length;
+      const rest = bs.filter((b) => !returning.includes(b)).flatMap((b) => b.lines);
+      if (rest.some((l) => OPEN_RE.test(l) || TICK_RE.test(l))) keptB.push(sec.heading, ...collapseBlanks(rest));
+    }
+    if (restored) {
+      backlog = collapseRules(keptB.join('\n'));
+      todo = restoreInto(todo, back);
+    }
+  }
+  if (entries.length) backlog = applyToArchive(backlog, entries.map((e) => ({ ...e, kind: 'items', intro: '' })), today);
+  return { todo, backlog, moved, restored, file };
+}
+
+/**
+ * Put dated-again items back under their ORIGINAL section heading (recreated at the end if that
+ * section has since been archived), decrementing that section's backlog pointer, so the item
+ * returns where it was and its fleet-ledger id depends only on its own text.
+ */
+function restoreInto(todoText, back) {
+  const { preamble, sections } = splitSections(todoText);
+  const out = [...preamble];
+  const pending = new Map(back.map((b) => [b.heading, b.lines]));
+  for (const sec of sections) {
+    const add = pending.get(sec.heading);
+    if (!add) { out.push(sec.heading, ...sec.body); continue; }
+    pending.delete(sec.heading);
+    const n = add.filter((l) => OPEN_RE.test(l)).length;
+    const body = [];
+    let placed = false;
+    for (const l of sec.body) {
+      const m = BACKLOG_STUB_RE.exec(l);
+      if (m && !placed) {
+        const left = Number(m[1]) - n;
+        if (left > 0) body.push(l.replace(/^- \*\d+ undated items?/, `- *${left} undated item${left === 1 ? '' : 's'}`));
+        body.push(...add);
+        placed = true;
+        continue;
+      }
+      body.push(l);
+    }
+    if (!placed) {
+      while (body.length && body.at(-1) === '') body.pop();
+      body.push(...add, '');
+    }
+    out.push(sec.heading, ...body);
+  }
+  let text = out.join('\n');
+  for (const [heading, lines] of pending) text = `${text.replace(/\n*$/, '\n')}\n${heading}\n\n${lines.join('\n')}\n`;
+  return collapseRules(text);
+}
+
+/** Open items are conserved across TODO.md + BACKLOG.md, and no other line disappears. */
+export function verifyBacklog(oldTodo, newTodo, oldBacklog, newBacklog) {
+  const problems = [];
+  const all = (a, b) => counts([...a.split('\n'), ...b.split('\n')]);
+  const before = all(oldTodo, oldBacklog);
+  const after = all(newTodo, newBacklog);
+  for (const [l, n] of before) {
+    if (trivial(l) || BACKLOG_STUB_RE.test(l) || /^## /.test(l) || /^<a id=/.test(l)) continue;
+    if ((after.get(l) || 0) < n) problems.push(`lost in the backlog move: ${l.slice(0, 120)}`);
+  }
+  const open = (t) => t.split('\n').filter((l) => OPEN_RE.test(l)).length;
+  if (open(oldTodo) + open(oldBacklog) !== open(newTodo) + open(newBacklog)) problems.push(`open items: ${open(oldTodo) + open(oldBacklog)} before, ${open(newTodo) + open(newBacklog)} after (TODO.md + backlog)`);
+  return problems;
 }
 
 // ─── compaction (open lines) ────────────────────────────────────────────────
@@ -497,6 +657,8 @@ export function verifyMove(oldTodo, newTodo, oldArchive, newArchive) {
   }
   for (const [l, n] of before) {
     if (trivial(l)) continue;
+    // A section heading whose archive entry already exists is not re-written under it.
+    if (/^#{2,3} /.test(l) && newArchive.split('\n').includes(l)) continue;
     const gone = n - (after.get(l) || 0);
     if (gone > 0 && (added.get(l) || 0) < gone) problems.push(`removed but not in the archive: ${l.slice(0, 120)}`);
   }
@@ -608,7 +770,18 @@ function main(argv) {
   if (args.has('--staged')) return staged(root, cfg, today, file);
 
   if (!existsSync(todoPath)) { console.error(`[todo-budget] UNCHECKED: no TODO.md in ${root}`); return 1; }
-  const todoText = readFileSync(todoPath, 'utf8');
+  const origTodo = readFileSync(todoPath, 'utf8');
+  let todoText = origTodo;
+  const backlogPath = join(root, cfg.backlogFile);
+  const origBacklog = existsSync(backlogPath) ? readFileSync(backlogPath, 'utf8') : null;
+  let bk = null;
+  if (args.has('--backlog')) {
+    bk = planBacklog(origTodo, origBacklog, today, cfg);
+    const bp = verifyBacklog(origTodo, bk.todo, origBacklog ?? '', bk.backlog);
+    if (bp.length) { console.error(`[todo-budget] REFUSED: the backlog move would lose content:\n  ${bp.slice(0, 10).join('\n  ')}`); return 1; }
+    console.log(`backlog: ${bk.moved} undated item(s) -> ${cfg.backlogFile}, ${bk.restored} dated item(s) back to TODO.md`);
+    todoText = bk.todo;
+  }
 
   if (args.has('--check')) {
     let bad = 0;
@@ -634,7 +807,7 @@ function main(argv) {
   }
 
   const p = planAll(todoText, readArchive(), today, cfg, { compact: args.has('--compact') || args.has('--prose'), prose: args.has('--prose'), needles });
-  const before = bytes(todoText);
+  const before = bytes(origTodo);
   const after = bytes(p.todo);
 
   if (args.has('--report')) {
@@ -651,6 +824,9 @@ function main(argv) {
     const pr = planAll(todoText, readArchive(), today, cfg, { compact: true, prose: true, needles });
     console.log(`  after --compact --write  ${fmt(bytes(c.todo))} bytes  (${c.stats.compacted} open lines shortened; > ${cfg.hardLine} B left: ${ma.overHard})`);
     console.log(`  after --prose --write    ${fmt(bytes(pr.todo))} bytes  (+ context of ${pr.stats.proseSections} open sections, older than ${cfg.recentDays} days)`);
+    const bl = planBacklog(todoText, origBacklog, today, cfg);
+    const pb = planAll(bl.todo, readArchive(), today, cfg, { compact: true, needles });
+    console.log(`  after --backlog --compact --write  ${fmt(bytes(pb.todo))} bytes  (${bl.moved} undated items older than ${cfg.backlogAfterDays} days -> ${cfg.backlogFile})`);
     const best = bytes(c.todo) <= cfg.ceiling ? 'reachable by --write/--compact' : bytes(pr.todo) <= cfg.ceiling ? 'reachable only with --prose (section context moves out)' : `${fmt(bytes(pr.todo) - cfg.ceiling)} bytes over even with --prose - the open list itself must shrink`;
     console.log(`  verdict: ${best}`);
     const longest = todoText.split('\n').map((l, i) => ({ l, i })).filter((x) => OPEN_RE.test(x.l)).sort((a, b) => bytes(b.l) - bytes(a.l)).slice(0, 10);
@@ -667,11 +843,12 @@ function main(argv) {
     return 1;
   }
   if (!args.has('--write')) { console.log('\n(dry run - --write to move them)'); return 0; }
-  if (!p.entries.length && p.todo === todoText) return 0;
+  if (!p.entries.length && p.todo === origTodo) return 0;
   const outTodo = join(outDir, 'TODO.md');
   const outArch = join(outDir, file);
   mkdirSync(dirname(outArch), { recursive: true });
   if (p.entries.length) writeFileSync(outArch, p.archive);
+  if (bk && (bk.moved || bk.restored)) writeFileSync(join(outDir, cfg.backlogFile), bk.backlog);
   writeFileSync(outTodo, p.todo);
   console.log(`Wrote ${outTodo}${p.entries.length ? ` and ${outArch}` : ''}.`);
   return 0;
@@ -681,7 +858,25 @@ function main(argv) {
 function staged(root, cfg, today, file) {
   const show = git(root, 'show', ':TODO.md');
   if (show.status !== 0) return 0; // TODO.md not in the index (deleted / never added)
-  const text = show.stdout;
+  let text = show.stdout;
+  // A staged backlog item that gained a leading date goes back to TODO.md now.
+  const bshow = git(root, 'show', `:${cfg.backlogFile}`);
+  if (bshow.status === 0 && bshow.stdout.split('\n').some((l) => OPEN_RE.test(l) && leadingDate(l))) {
+    const workT = readFileSync(join(root, 'TODO.md'), 'utf8');
+    const workB = readFileSync(join(root, cfg.backlogFile), 'utf8');
+    if (workT !== text || workB !== bshow.stdout) {
+      console.error(`[todo-budget] ${cfg.backlogFile} has a dated item to move back, but TODO.md or ${cfg.backlogFile} has unstaged changes. Stage both and commit again.`);
+      return 1;
+    }
+    const r = planBacklog(text, bshow.stdout, today, { ...cfg, backlogAfterDays: Infinity });
+    if (r.restored && !verifyBacklog(text, r.todo, bshow.stdout, r.backlog).length) {
+      writeFileSync(join(root, 'TODO.md'), r.todo);
+      writeFileSync(join(root, cfg.backlogFile), r.backlog);
+      git(root, 'add', '--', 'TODO.md', cfg.backlogFile);
+      console.error(`[todo-budget] ${r.restored} dated item(s) moved back from ${cfg.backlogFile} to TODO.md (re-staged).`);
+      text = r.todo;
+    }
+  }
   const size = bytes(text);
   const headText = git(root, 'show', 'HEAD:TODO.md').stdout || '';
   const old = new Set(headText.split('\n'));
@@ -690,7 +885,16 @@ function staged(root, cfg, today, file) {
   if (size <= cfg.ceiling) return 0;
   const archivePath = join(root, file);
   const archText = existsSync(archivePath) ? readFileSync(archivePath, 'utf8') : null;
-  const p = planAll(text, archText, today, cfg);
+  const backlogPath = join(root, cfg.backlogFile);
+  const backText = existsSync(backlogPath) ? readFileSync(backlogPath, 'utf8') : null;
+  let p = planAll(text, archText, today, cfg);
+  let bk = null;
+  if (bytes(p.todo) > cfg.ceiling) {
+    // Archiving alone is not enough: move stale undated items to the backlog first.
+    bk = planBacklog(text, backText, today, cfg);
+    if (verifyBacklog(text, bk.todo, backText ?? '', bk.backlog).length) bk = null;
+    else p = planAll(bk.todo, archText, today, cfg);
+  }
   const after = bytes(p.todo);
   const head = `[todo-budget] staged TODO.md is ${fmt(size)} bytes, over its ${fmt(cfg.ceiling)}-byte ceiling.`;
   if (after > cfg.ceiling) {
@@ -715,13 +919,15 @@ function staged(root, cfg, today, file) {
     console.error('    node scripts/todo-budget.mjs --write && git add TODO.md ' + file);
     return 1;
   }
-  const problems = verifyMove(text, p.todo, archText ?? '', p.archive);
+  const problems = verifyMove(bk ? bk.todo : text, p.todo, archText ?? '', p.archive);
   if (problems.length) { console.error(`${head}\n[todo-budget] REFUSED to auto-archive: ${problems[0]}`); return 1; }
   mkdirSync(dirname(archivePath), { recursive: true });
-  writeFileSync(archivePath, p.archive);
+  if (p.entries.length) writeFileSync(archivePath, p.archive);
+  if (bk && bk.moved) writeFileSync(backlogPath, bk.backlog);
   writeFileSync(join(root, 'TODO.md'), p.todo);
-  const add = git(root, 'add', '--', 'TODO.md', file);
+  const add = git(root, 'add', '--', 'TODO.md', ...(p.entries.length ? [file] : []), ...(bk && bk.moved ? [cfg.backlogFile] : []));
   if (add.status !== 0) { console.error(`[todo-budget] git add failed: ${add.stderr}`); return 1; }
+  if (bk && bk.moved) console.error(`[todo-budget] ${bk.moved} undated item(s) older than ${cfg.backlogAfterDays} days -> ${cfg.backlogFile} (re-staged).`);
   console.error(`[todo-budget] auto-archived: TODO.md ${fmt(size)} -> ${fmt(after)} bytes (${p.stats.sections} sections, ${p.stats.subsections} subsections, ${p.stats.items} ticked items -> ${file}); both re-staged.`);
   return 0;
 }

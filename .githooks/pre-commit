@@ -11,11 +11,14 @@
 # Staged TODO.md over the ceiling:
 #   - archiving closed sections/items alone gets it under -> the hook does it and re-stages
 #     TODO.md + the quarter's archive (only when TODO.md has no unstaged changes);
+#   - archiving is not enough -> stale UNDATED open items move to BACKLOG.md first, then the same;
 #   - otherwise it refuses, with the exact commands. Never bypass it with --no-verify.
+# Staged BACKLOG.md with a dated item -> that item moves back into TODO.md, both re-staged.
 set -uo pipefail
 ROOT="$(git rev-parse --show-toplevel)"
 
-git diff --cached --name-only --diff-filter=ACMR -- TODO.md | grep -qx 'TODO.md' || exit 0
+# TODO.md or BACKLOG.md staged (a backlog item that gained a date moves back to TODO.md).
+git diff --cached --name-only --diff-filter=ACMR -- TODO.md BACKLOG.md | grep -qxE 'TODO.md|BACKLOG.md' || exit 0
 
 command -v node >/dev/null 2>&1 || {
     echo "[todo-budget] UNCHECKED: node not on PATH - refusing the commit (TODO.md is staged)." >&2; exit 1; }
