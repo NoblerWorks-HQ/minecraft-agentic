@@ -92,11 +92,31 @@
  *                     script itself is untouched - CI and deploys still run it
  *                     serially. 1 opts a repo out (a suite with a fixed port or a
  *                     shared container). See "two workers" below.
+ *   stepTimeoutMin    minutes any one step may run before it is stopped and reported
+ *                     UNCHECKED (default 45). Per step: `timeouts: {"<label>": min}`,
+ *                     or `timeoutMin` on an extraStep. See "step timeout" below.
+ *   tmpDir            TMPDIR for every step (default ~/.cache/local-ci/tmp, on disk).
+ *                     See "temp on disk" below.
  *
  * Bypass: `git push --no-verify`, or SKIP_LOCAL_CI=1.
  * Force the gate even when Actions is green: LOCAL_CI_FORCE=1.
  * Ignore the pass cache for one run: LOCAL_CI_NO_CACHE=1.
  * Run every step even after an `early` step fails: LOCAL_CI_KEEP_GOING=1.
+ *
+ * STEP TIMEOUT (2026-10-31). On 2026-10-20 two achilles gates ran `backend:
+ * test:ci` for 21,780 s and 21,542 s - a hang or a host suspend - holding both
+ * machine-wide slots for six hours while semantix and gitgood queued behind
+ * them (runs.jsonl). A step now has a ceiling (default 45 min; the slowest
+ * healthy step in 1,049 runs was 28 min). Hitting it kills the step's whole
+ * process group and reports UNCHECKED "timed out", never a pass and never a
+ * FAIL: a hang is not a verdict about the code, and the push stays blocked.
+ *
+ * TEMP ON DISK (2026-10-31). /tmp here is a RAM-backed tmpfs. No repo set a
+ * jest cacheDirectory, so jest's cache (os.tmpdir()/jest_*) reached 2.8 GB of
+ * RAM, and on 2026-09-14 it and the node compile cache filled the then 3.9 GB
+ * tmpfs to zero. Steps now get TMPDIR=~/.cache/local-ci/tmp (cfg.tmpDir,
+ * LOCAL_CI_TMPDIR), so jest's cache and every test's mkdtemp land on disk.
+ * Entries untouched for 14 days are pruned at gate start.
  *
  * THE MACHINE-WIDE GATE QUEUE (2026-10-15). At most LOCAL_CI_SLOTS (default 2)
  * gates, across every repo and session on this machine, run their steps at once:
@@ -107,7 +127,7 @@
  * appends one line to ~/.cache/local-ci/runs.jsonl (LOCAL_CI_QUEUE_DIR moves both;
  * the tests use it).
  */
-import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync, appendFileSync, unlinkSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, renameSync, mkdirSync, appendFileSync, unlinkSync, rmSync, statSync, readdirSync } from 'node:fs';
 import { spawnSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { freemem, totalmem, loadavg, cpus, homedir, getPriority, setPriority, constants as osConstants } from 'node:os';
@@ -143,10 +163,44 @@ const parallel    = cfg.parallel ?? (totalmem() >= 16 * 1024 ** 3);
 const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
 const jestWorkers = cfg.jestWorkers ?? (totalmem() >= 7 * 1024 ** 3 ? 2 : 1);
 const niceness    = Number.isInteger(cfg.niceness) ? cfg.niceness : 10;
+const stepTimeoutMin = Number(process.env.LOCAL_CI_STEP_TIMEOUT_MIN) || cfg.stepTimeoutMin || 45;
+const stepTimeouts   = cfg.timeouts ?? {};
+const STEP_TMPDIR    = process.env.LOCAL_CI_TMPDIR || cfg.tmpDir || join(homedir(), '.cache', 'local-ci', 'tmp');
 // Free memory a multi-worker jest run needs at the moment it starts; below this
 // the step runs the script as written (serial) rather than wait. Measured peaks
 // with two workers + workerIdleMemoryLimit=1GB: 1.5-2.6 GB (2026-09-13).
 const JEST_WORKERS_MIN_FREE_MB = 3072;
+
+/** The steps' TMPDIR exists, and what nothing touched for 14 days is gone. Never fails a gate. */
+function prepareStepTmp() {
+  try {
+    mkdirSync(STEP_TMPDIR, { recursive: true });
+    const cutoff = Date.now() - 14 * 86_400_000;
+    for (const name of readdirSync(STEP_TMPDIR)) {
+      const p = join(STEP_TMPDIR, name);
+      try { if (statSync(p).mtimeMs < cutoff) rmSync(p, { recursive: true, force: true }); } catch {}
+    }
+    return true;
+  } catch { return false; }
+}
+const stepTmpOk = prepareStepTmp();
+const STEP_ENV = stepTmpOk ? { TMPDIR: STEP_TMPDIR, TMP: STEP_TMPDIR, TEMP: STEP_TMPDIR } : {};
+// A push from a LINKED worktree runs this hook with an absolute GIT_DIR (and
+// friends) exported. A test doing `git -C <tmp> init/commit` then writes to the
+// real repo: on 2026-10-30 that set core.bare on nobler-starter-web-app and its
+// fixture commits replaced GitHub main. Steps find the repo from their cwd instead.
+const GIT_LEAK_VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
+  'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH'];
+function stepEnv(extra) {
+  const env = { ...process.env, ...STEP_ENV, ...(extra || {}) };
+  for (const k of GIT_LEAK_VARS) delete env[k];
+  return env;
+}
+/** Kill a step and everything it started (jest workers, turbo children). */
+function killTree(child, sig) {
+  if (!child?.pid) return;
+  try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} }
+}
 
 // The gate's own per-machine files. They are gitignored by install-local-ci.sh,
 // but a repo stamped before that line existed would otherwise read as "dirty"
@@ -596,6 +650,7 @@ for (const s of extraSteps) {
     // Cached only when the manifest says what the command reads. `fleet parity`
     // reads sibling repos, so a tree hash of this one can never vouch for it.
     inputs: Array.isArray(s.inputs) ? [s.dir || '.', ...s.inputs] : null,
+    timeoutMin: s.timeoutMin,
   });
 }
 
@@ -789,6 +844,15 @@ const t0 = Date.now();
 // wait), so the next audit reads numbers instead of reconstructing them.
 const QUEUE_DIR = process.env.LOCAL_CI_QUEUE_DIR || join(homedir(), '.cache', 'local-ci');
 const SLOTS = Math.max(1, parseInt(process.env.LOCAL_CI_SLOTS || '', 10) || 2);
+// BURST SLOT (2026-10-31). Two slots is right for a busy machine - the 31 Oct
+// audit measured coverage at 197 s under load 10 and 334 s above it - but on a
+// quiet one it leaves cores idle while gates queue (34 h of slot waits in 15
+// days). One more slot opens only while load1 is under 70% of the cores and 8 GB
+// is free, checked each time a gate looks for a slot; a gate that got it keeps it.
+const BURST_SLOTS = Math.max(0, parseInt(process.env.LOCAL_CI_BURST_SLOTS ?? '1', 10) || 0);
+const BURST_MAX_LOAD = Number(process.env.LOCAL_CI_BURST_MAX_LOAD) || cpus().length * 0.7;
+const BURST_MIN_FREE_MB = Number(process.env.LOCAL_CI_BURST_MIN_FREE_MB) || 8192;
+const burstOpen = () => BURST_SLOTS > 0 && loadavg()[0] < BURST_MAX_LOAD && freemem() / 1048576 >= BURST_MIN_FREE_MB;
 const NO_QUEUE = process.env.LOCAL_CI_NO_QUEUE === '1' ? 'LOCAL_CI_NO_QUEUE=1'
   : process.env.LOCAL_CI_SLOT_HELD === '1' ? 'a gate running inside a gate that already holds a slot'
   : null;
@@ -834,7 +898,7 @@ function tryDirLock(n) {
 
 function holders() {
   const out = [];
-  for (let n = 1; n <= SLOTS; n++) {
+  for (let n = 1; n <= SLOTS + BURST_SLOTS; n++) {
     const j = readJson(join(QUEUE_DIR, `slot-${n}.json`));
     if (j && pidAlive(j.pid)) {
       const t = new Date(j.since);
@@ -859,7 +923,8 @@ async function acquireSlot() {
   const w0 = Date.now();
   let said = false, useFlock = true;
   for (;;) {
-    for (let n = 1; n <= SLOTS && !slot; n++) {
+    const limit = SLOTS + (burstOpen() ? BURST_SLOTS : 0);
+    for (let n = 1; n <= limit && !slot; n++) {
       if (useFlock) {
         const r = await tryFlock(join(QUEUE_DIR, `slot-${n}.lock`));
         if (r === 'noflock') {
@@ -876,7 +941,7 @@ async function acquireSlot() {
     if (!said) {
       said = true;
       console.log(`${C.y}  waiting for gate slot (held by ${holders()})${C.n}`);
-      console.log(`${C.d}  … ${SLOTS} gate(s) may run at once machine-wide (LOCAL_CI_SLOTS); LOCAL_CI_NO_QUEUE=1 bypasses in an emergency${C.n}`);
+      console.log(`${C.d}  … ${SLOTS} gate(s) may run at once machine-wide (LOCAL_CI_SLOTS), ${SLOTS + BURST_SLOTS} while the machine is quiet; LOCAL_CI_NO_QUEUE=1 bypasses in an emergency${C.n}`);
     }
     await sleep(2000);
   }
@@ -925,7 +990,7 @@ function recordRun(outcome) {
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
   process.on(sig, () => {
-    for (const r of running) { try { r.child?.kill(sig); } catch {} }
+    for (const r of running) killTree(r.child, sig);
     recordRun('killed');
     releaseSlot();
     process.exit(128 + (osConstants.signals[sig] || 1));
@@ -976,18 +1041,29 @@ function runStep(s, key) {
     // spawnSync maxBuffer had to be raised to 256 MiB to stop a false red.
     const child = spawn(cmd, args, {
       cwd: s.cwd, shell: process.platform === 'win32',
-      env: s.env ? { ...process.env, ...s.env } : process.env,
+      env: stepEnv(s.env),
+      // Its own process group, so a timeout or a signal stops the step's children too.
+      detached: process.platform !== 'win32',
       // No TTY and no stdin: a step that wants to prompt must fail, not wait.
       // `next lint` on an unconfigured repo asks "How would you like to configure
       // ESLint?" and rendered an arrow-key menu into the captured output.
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     entry.child = child;
+    const limitMin = Number(stepTimeouts[s.label] ?? s.timeoutMin ?? stepTimeoutMin);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killTree(child, 'SIGTERM');
+      setTimeout(() => killTree(child, 'SIGKILL'), 10_000).unref();
+    }, limitMin * 60_000);
+    timer.unref();
     child.stdout.on('data', keep);
     child.stderr.on('data', keep);
     const finish = (code, err, signal) => {
       if (finished) return;
       finished = true;
+      clearTimeout(timer);
       running.delete(entry);
       const ms = Date.now() - st;
       const dt = secs(ms);
@@ -995,6 +1071,11 @@ function runStep(s, key) {
         printResult(s.label, `${C.r}UNCHECKED${C.n} ${C.d}(${s.cmd} not found)${C.n}`);
         failed.push(`${s.label} (tooling missing)`);
         results.set(s.label, { state: 'unchecked', seconds: +dt });
+      } else if (timedOut) {
+        printResult(s.label, `${C.r}UNCHECKED${C.n} ${C.d}(timed out after ${limitMin} min - hung? not a code failure; raise it with "timeouts" in .ci-local.json if the step is just slow)${C.n}`);
+        failed.push(`${s.label} (timed out after ${limitMin} min, not a code failure)`);
+        results.set(s.label, { state: 'timeout', seconds: +dt });
+        console.log(tail.trimEnd().split('\n').slice(-15).map((l) => `      ${l}`).join('\n'));
       } else if (signal) {
         // A signal is not a verdict about the code. SIGKILL here is almost always
         // the OOM killer - reporting it as FAIL sends someone hunting a bug.
