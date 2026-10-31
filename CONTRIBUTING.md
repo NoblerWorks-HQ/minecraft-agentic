@@ -24,9 +24,9 @@ See [docs/SETUP.md](docs/SETUP.md) for the walkthrough and troubleshooting.
 3. **Touched bot connection, block placement, or the viewer?** Run `npm run e2e`
    (single bot) or `npm run replay` (full crew) against a live server - both work with
    no API key. `npm run test:viewer` checks the browser actually sees what the crew built.
-4. **Read [CLAUDE.md](CLAUDE.md) for the area you're changing.** It is the project's
-   invariant list - every entry is a bug that shipped, how it was found, and the rule that
-   keeps it dead. If your change fights one of those rules, the rule usually wins; if the
+4. **Read [CLAUDE.md](CLAUDE.md) and [docs/INVARIANTS.md](docs/INVARIANTS.md) for the area
+   you're changing.** They are the project's invariant list (digest + full text) - every entry
+   is a bug that shipped, how it was found, and the rule that keeps it dead. If your change fights one of those rules, the rule usually wins; if the
    rule is wrong, update it in the same PR.
 
 ## Ground rules that bite newcomers

@@ -473,7 +473,7 @@ test/             pick-ground / agent-loops / ops / preset-audit / viewer-sync
 
 More depth: [docs/FEATURES.md](docs/FEATURES.md) (every user-visible feature),
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how a prompt becomes a building),
-[CLAUDE.md](CLAUDE.md) (invariants + hard-won gotchas), [docs/SETUP.md](docs/SETUP.md)
+[CLAUDE.md](CLAUDE.md) (invariant digest; full text in [docs/INVARIANTS.md](docs/INVARIANTS.md)), [docs/SETUP.md](docs/SETUP.md)
 (setup + troubleshooting). Want to contribute? [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## ❓ FAQ

@@ -154,11 +154,12 @@ usernames opped** (the bots build with `/setblock`, which needs operator permiss
 
 ### Option A - Docker (recommended)
 
-The repo ships a `docker-compose.yml` that sets all of that up for you (pinned to 1.20.1,
-online-mode off, and every default bot username auto-opped). Just:
+`npm run server` (`scripts/server.js`, plain `docker` - no compose plugin needed) sets all of that
+up for you (pinned to 1.20.1, online-mode off, every default bot username auto-opped).
+`docker-compose.yml` is an optional alternative. Just:
 
 ```bash
-npm run server        # = docker compose up -d
+npm run server        # = node scripts/server.js up
 npm run server:logs   # wait for: "Done (12.345s)! For help, type help"  - then Ctrl+C
 ```
 
@@ -238,9 +239,13 @@ npm run server:recreate                # rebuild the container, KEEP the world -
                                        #   changed server setting (view distance, memory) takes effect
 npm run demo "a watchtower"            # single bot instead of the crew (needs key)
 npm start                              # interactive - type prompts one by one
-npm run offline                        # no Docker/server/key - just prints a sample plan
+npm run offline                        # no AI key - builds a cached plan from src/plans/ (still needs the server)
+npm run setup                          # onboarding: creates .env, checks Node/Docker/server
+npm run ops                            # regenerate docker/ops.json (offline-UUID operators)
+npm run record                         # timelapse from a RUNNING `npm run web` (needs ffmpeg + playwright)
 
-npm test                               # click-to-place + preset integrity (no browser, no server)
+npm test                               # http-guard, click-to-place, agent loops, ops, preset audit (no browser, no server)
+npm run test:loops / test:ops / test:presets   # one suite each (no server, no key)
 npm run test:viewer                    # does the browser see what the crew built? (needs a server)
 npm run replay                         # crew builds from a cached plan (needs a server, no key)
 npm run e2e                            # single-bot smoke test (needs a server, no key)
@@ -299,7 +304,7 @@ can walk around, or even place blocks alongside them.
 |---------|-----|
 | `ECONNREFUSED` / bots won't connect | The server isn't up yet. Wait for "Done!" in the server logs (Step 1), confirm it's on port 25565. |
 | Bots connect but nothing builds | The bots aren't opped. `/setblock` needs operator permission - `npm run server` mounts `docker/ops.json` to op them, or `op <botname>` in the server console. Custom `MC_USERNAME`? Run `npm run ops -- YourBotName` then restart the server. |
-| Server won't start / "Could not resolve user from Playerdb" | You're using the `OPS` env var on an offline-mode server - it does an online lookup that fails. Remove it and use the mounted `docker/ops.json` instead (that's what compose does). |
+| Server won't start / "Could not resolve user from Playerdb" | You're using the `OPS` env var on an offline-mode server - it does an online lookup that fails. Remove it and use the mounted `docker/ops.json` instead (that's what `npm run server` and compose do). |
 | Bots connect but nothing builds (still) | Command blocks must be enabled (`ENABLE_COMMAND_BLOCK=TRUE` / `enable-command-block=true`). |
 | `did not return valid JSON` / build plan fails | Your model returned malformed JSON. Check the key has credit, try again, or use a stronger model (Gemini/Claude/GPT beat small Ollama models at this). No key at all just uses the library. |
 | Browser viewer won't load / "viewer unavailable" | `canvas` didn't build - see [Browser viewer](#browser-viewer) above, or just watch in-game. |
