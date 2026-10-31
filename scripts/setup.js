@@ -21,9 +21,9 @@ console.log(b('\n  Minecraft Agentic Builder - setup check\n'));
 
 // 1. Node version
 const major = parseInt(process.versions.node.split('.')[0], 10);
-// 20 is the floor in package.json engines, and the oldest version CI proves green.
-if (major >= 20) ok.push(`Node ${process.versions.node}`);
-else todo.push(`Node ${process.versions.node} is too old - install Node 20+ (nodejs.org)`);
+// 22 is the floor in package.json engines, and the oldest version CI proves green.
+if (major >= 22) ok.push(`Node ${process.versions.node}`);
+else todo.push(`Node ${process.versions.node} is too old - install Node 22+ (nodejs.org; 24 recommended)`);
 
 // 2. .env
 const envPath = path.join(root, '.env');

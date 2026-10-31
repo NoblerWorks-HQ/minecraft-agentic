@@ -29,7 +29,7 @@ free built-in library, no API key) designs the build, and four Mineflayer bots c
 block by block on a local server while you watch.*
 
 [![CI](https://github.com/NoblerWorks-HQ/minecraft-agentic/actions/workflows/ci.yml/badge.svg)](https://github.com/NoblerWorks-HQ/minecraft-agentic/actions/workflows/ci.yml)
-[![Node 20+](https://img.shields.io/badge/node-20%2B-brightgreen)](https://nodejs.org)
+[![Node 22+](https://img.shields.io/badge/node-22%2B-brightgreen)](https://nodejs.org)
 [![Minecraft 1.20.1](https://img.shields.io/badge/minecraft-1.20.1-blue)](https://www.minecraft.net)
 [![Works with no API key](https://img.shields.io/badge/API%20key-optional-orange)](#-pick-your-ai)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
@@ -68,7 +68,7 @@ you:   type an idea, click the ground where you want it, watch it go up
 
 ## ⚡ Quick start
 
-You need **[Docker](https://www.docker.com/products/docker-desktop/)** and **Node.js 20+**.
+You need **[Docker](https://www.docker.com/products/docker-desktop/)** and **Node.js 22+** (24 recommended, see `.nvmrc`).
 That's it - no Minecraft account, no API key.
 
 ```bash

@@ -38,7 +38,7 @@ body:
       description: OS, Node version, and whether you used the bundled Docker server (`npm run server`) or your own.
       placeholder: |
         OS: Ubuntu 24.04 (WSL2)
-        Node: 22.x
+        Node: 24.x
         Server: bundled (npm run server) / own server, version 1.20.1
     validations:
       required: true

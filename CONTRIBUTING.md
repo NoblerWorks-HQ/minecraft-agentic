@@ -16,7 +16,7 @@ See [docs/SETUP.md](docs/SETUP.md) for the walkthrough and troubleshooting.
 ## Before you open a PR
 
 1. **Run `npm test`.** It needs no server and no key, and CI runs exactly this plus
-   `npm audit --audit-level=high` on Node 20 and 22.
+   `npm audit --audit-level=high` on Node 22 and 24.
 2. **Touched `src/library/` or the crew's scheduling?** Run `npm run test:presets` - it
    simulates every preset on the crew's real parallel schedule with vanilla physics
    (neighbor-update pops, gravity, door support). It has caught ~145 silent defects that
