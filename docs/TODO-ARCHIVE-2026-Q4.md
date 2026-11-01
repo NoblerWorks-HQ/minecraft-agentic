@@ -234,3 +234,12 @@ Read-only fleet audit (9 agents, nothing changed). Each line: effort S (<half da
 - [x] ~~**Fix: pin server to 1.20.4** (itzg defaults to latest = connect mismatch)~~ ✅ done 2026-07-10
 - [x] ~~**Fix: viewer port-in-use crash** - `startViewer` now pre-checks the port and degrades gracefully~~ ✅ done 2026-07-10
 - [x] ~~Streamline onboarding: `npm run setup`, `npm run server`, `src/preflight.js` friendly errors~~ ✅ done 2026-07-10
+
+<a id="node-24-2026-10-31"></a>
+
+## Node 24 (2026-10-31)
+
+*Whole section lifted from `TODO.md` 2026-11-01; nothing in it was open.*
+
+
+- [x] 2026-10-31 Develop on Node 24 (`.nvmrc`); CI matrix 22 + 24; `engines` floor raised from 20 (EOL 2026-04-30) to 22; README, SETUP, CONTRIBUTING, `scripts/setup.js` follow. `canvas` builds and loads on 24.
