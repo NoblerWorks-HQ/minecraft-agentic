@@ -92,6 +92,10 @@
  *                     script itself is untouched - CI and deploys still run it
  *                     serially. 1 opts a repo out (a suite with a fixed port or a
  *                     shared container). See "two workers" below.
+ *   flaky             what a red test step does when its failing test files pass when re-run
+ *                     alone: 'block' (default: still red, labelled likely flaky), 'allow' (the
+ *                     step passes as "pass (flaky)"; Patrick's call per repo), 'off' (no re-run).
+ *                     Every re-run is appended to ~/.cache/local-ci/flaky.jsonl.
  *   stepTimeoutMin    minutes any one step may run before it is stopped and reported
  *                     UNCHECKED (default 45). Per step: `timeouts: {"<label>": min}`,
  *                     or `timeoutMin` on an extraStep. See "step timeout" below.
@@ -189,6 +193,10 @@ const inputsCfg   = cfg.inputs ?? {};
 const parallel    = cfg.parallel ?? (totalmem() >= 16 * 1024 ** 3);
 const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
 const jestWorkers = cfg.jestWorkers ?? (totalmem() >= 7 * 1024 ** 3 ? 2 : 1);
+// Flaky catcher: a red test step re-runs ONLY its failing test files, alone, once. 'block' (default)
+// still fails the push but labels it "passed alone: likely flaky"; 'allow' lets it through as
+// "pass (flaky)" and records it; 'off' skips the re-run. Every outcome lands in flaky.jsonl.
+const flakyMode   = ['block', 'allow', 'off'].includes(cfg.flaky) ? cfg.flaky : 'block';
 const niceness    = Number.isInteger(cfg.niceness) ? cfg.niceness : 10;
 const stepTimeoutMin = Number(process.env.LOCAL_CI_STEP_TIMEOUT_MIN) || cfg.stepTimeoutMin || 45;
 const stepTimeouts   = cfg.timeouts ?? {};
@@ -218,9 +226,15 @@ const STEP_ENV = stepTmpOk ? { TMPDIR: STEP_TMPDIR, TMP: STEP_TMPDIR, TEMP: STEP
 // fixture commits replaced GitHub main. Steps find the repo from their cwd instead.
 const GIT_LEAK_VARS = ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
   'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX', 'GIT_QUARANTINE_PATH'];
+// A loop's lander/worker pushes through this gate with the loop runner's
+// model-recording env set; nobler-os's loops tests then ran their fake claude and
+// appended fixture rows (model null / "y") to the REAL ledger row (2026-11-02..07).
+// First fixed only in nobler-os's generated copy (159e4d4a8, 11-04), which the next
+// restamp erased - so it lives here. Steps never record models.
+const LOOP_LEAK_VARS = ['LOOP_MODELS_FILE', 'LOOP_MODEL', 'LOOP_REVIEW_MODEL'];
 function stepEnv(extra) {
   const env = { ...process.env, ...STEP_ENV, ...(extra || {}) };
-  for (const k of GIT_LEAK_VARS) delete env[k];
+  for (const k of [...GIT_LEAK_VARS, ...LOOP_LEAK_VARS]) delete env[k];
   return env;
 }
 /** Kill a step and everything it started (jest workers, turbo children). */
@@ -1080,7 +1094,8 @@ function recordRun(outcome, signal) {
       start: new Date(t0).toISOString(), wallS: +((Date.now() - t0) / 1000).toFixed(1), outcome,
       steps: Object.fromEntries([...results].map(([l, r]) => [l, {
         s: r.ms != null ? +(r.ms / 1000).toFixed(1) : r.seconds, state: r.state,
-        ...(r.err ? { err: r.err } : {}), ...(r.tests?.length ? { tests: r.tests } : {}),
+        ...(r.err ? { err: r.err } : {}), ...(r.tests?.length ? { tests: r.tests } : {}), ...(r.names?.length ? { names: r.names } : {}),
+        ...(r.tasks?.length ? { tasks: r.tasks } : {}), ...(r.failLog ? { failLog: r.failLog } : {}),
       }])),
       related: Object.fromEntries(relatedRuns),
       // What the 2026-11-05 review could not tell apart: a fail-then-pass on one
@@ -1179,7 +1194,7 @@ function runStep(s, key) {
       } else if (timedOut) {
         printResult(s.label, `${C.r}UNCHECKED${C.n} ${C.d}(timed out after ${limitMin} min - hung? not a code failure; raise it with "timeouts" in .ci-local.json if the step is just slow)${C.n}`);
         failed.push(`${s.label} (timed out after ${limitMin} min, not a code failure)`);
-        results.set(s.label, { state: 'timeout', seconds: +dt });
+        results.set(s.label, { state: 'timeout', seconds: +dt, failLog: saveFailLog(s.label, tail) });
         console.log(tail.trimEnd().split('\n').slice(-15).map((l) => `      ${l}`).join('\n'));
       } else if (signal) {
         // A signal is not a verdict about the code. SIGKILL here is almost always
@@ -1201,12 +1216,30 @@ function runStep(s, key) {
         warned.push(s.label);
         results.set(s.label, { state: 'warn', seconds: +dt });
       } else {
-        printResult(s.label, `${C.r}FAIL${C.n} ${C.d}(${dt}s)${C.n}`);
-        failed.push(s.label);
         const digest = failureDigest(tail);
-        results.set(s.label, { state: 'fail', seconds: +dt, ...digest });
-        if (s.related) setLastFailed(s.label, digest.tests);
-        console.log(tail.trimEnd().split('\n').slice(-25).map((l) => `      ${l}`).join('\n'));
+        const failLog = saveFailLog(s.label, tail);
+        const red = (extra = '') => {
+          printResult(s.label, `${C.r}FAIL${C.n} ${C.d}(${dt}s)${C.n}${extra}`);
+          failed.push(s.label);
+          results.set(s.label, { state: 'fail', seconds: +dt, ...digest, failLog });
+          if (s.related) setLastFailed(s.label, digest.tests);
+          console.log(tail.trimEnd().split('\n').slice(-25).map((l) => `      ${l}`).join('\n'));
+        };
+        const close = () => { const r = results.get(s.label); if (r) r.ms = ms; done(); };
+        retryAlone(s, digest, tail).then((alone) => {
+          if (alone?.passed && flakyMode === 'allow') {
+            printResult(s.label, `${C.y}pass (flaky)${C.n} ${C.d}(${dt}s; failed in the batch, passed alone in ${alone.seconds}s: ${alone.files.join(', ')})${C.n}`);
+            warned.push(`${s.label} (flaky: ${alone.files.join(', ')})`);
+            results.set(s.label, { state: 'pass', flaky: alone.files, seconds: +dt, failLog });
+          } else if (alone?.passed) {
+            red(`\n      ${C.y}likely flaky: ${alone.files.join(', ')} passed when re-run alone (${alone.seconds}s). Still red ("flaky": "block"); fix the race or quarantine it.${C.n}`);
+            results.get(s.label).flaky = alone.files;
+          } else {
+            red(alone ? `\n      ${C.d}re-run alone: still failing - a real failure.${C.n}` : '');
+          }
+          close();
+        }, () => { red(); close(); });
+        return;
       }
       const r = results.get(s.label);
       if (r) r.ms = ms;
@@ -1218,12 +1251,121 @@ function runStep(s, key) {
 }
 
 const ANSI = /\u001b\[[0-9;]*m/g;
+/** Lines that look like failures but are logs or stack frames. */
+const NOISE = /^\s*(?:at\s|console\.(?:log|warn|error|info|debug)\b|●\s+Console\b)|"level":"(?:INFO|WARN|DEBUG)"|^\s*\d+:\d+\s+warning\s/;
 /** What a human needs from a red step's output. Bookkeeping only: never decides a verdict. */
 function failureDigest(text) {
-  const lines = String(text).replace(ANSI, '').split('\n');
+  const raw = String(text).replace(ANSI, '').split('\n');
+  // Turbo's summary names the failing package#task: `  Failed:    outreach-backend#test:coverage`.
+  const failedTasks = [...new Set(raw.flatMap((l) => l.match(/^\s*Failed:\s+(.+)$/)?.[1]?.split(/[\s,]+/).filter((t) => /#/.test(t)) ?? []))].slice(0, 10);
+  // Turbo prefixes every line (`outreach-backend:test:coverage: FAIL src/x.test.ts`), so strip that first.
+  const lines = raw.map((l) => l.replace(/^[@\w./-]+:[\w:-]+:\s?/, ''));
   const tests = [...new Set(lines.map((l) => l.match(/^\s*(?:FAIL|×|❯)\s+(\S+?\.(?:test|spec)\.[cm]?[jt]sx?)/)?.[1]).filter(Boolean))].slice(0, 20);
-  const first = lines.find((l) => /\b(?:error|failed|failure|exception|assert\w*)\b|[✕●×]/i.test(l))?.trim().slice(0, 200) ?? null;
-  return { err: first, tests };
+  // Jest's `● suite › name`; `● Console` is a log block, not a failure.
+  const names = [...new Set(lines.map((l) => l.match(/^\s*●\s+(.+)$/)?.[1]?.trim()).filter((n) => n && !/^Console\b/.test(n)))].slice(0, 20).map((n) => n.slice(0, 200));
+  // node --test TAP: `not ok 3 - name`; a parent suite repeats its child, so keep the innermost first.
+  const notOk = [...new Set(lines.map((l) => l.match(/^\s*not ok \d+ - (.+)$/)?.[1]?.trim()).filter(Boolean))].slice(0, 20);
+  const floor = lines.find((l) => /coverage threshold .* not met/i.test(l))?.trim();
+  const errLine = lines.find((l) => !NOISE.test(l) && (/\berror\b/i.test(l) && !/^\s*error:\s*\|-?\s*$/.test(l)))?.trim()
+    ?? lines.find((l) => !NOISE.test(l) && /\b(?:failed|failure|exception|assert\w*)\b|[✕×]/i.test(l))?.trim();
+  const detail = names[0] ?? notOk[0] ?? floor ?? errLine
+    ?? [...lines].reverse().find((l) => l.trim() && !NOISE.test(l))?.trim();
+  const where = failedTasks.length ? failedTasks.join(', ') : null;
+  const err = [where, detail].filter(Boolean).join(': ') || null;
+  return { err: err?.slice(0, 200) ?? null, tests, ...(names.length || notOk.length ? { names: [...names, ...notOk].slice(0, 20) } : {}), ...(failedTasks.length ? { tasks: failedTasks } : {}) };
+}
+
+/**
+ * The flaky catcher's re-run. Only a failure that NAMES its test files qualifies (vitest/jest
+ * `FAIL path`), and only when no coverage floor, typecheck or other error is in the output:
+ * those would not be explained by a test that raced. Each failing file is found in git, run by
+ * its own package's runner (vitest or jest, from the package's scripts) with coverage off,
+ * once. Returns null when it cannot isolate (then the step is red as before).
+ */
+let lsFiles = null;
+export function flakyEligible(text, digest) {
+  if (!digest?.tests?.length) return false;
+  const t = String(text).replace(ANSI, '');
+  if (/coverage threshold|ERROR: Coverage for|thresholds? (?:not met|for)/i.test(t)) return false;
+  if (/error TS\d+|SyntaxError|Cannot find module|Test Suites?: .*\bfailed\b.*\bto run\b/i.test(t)) return false;
+  return true;
+}
+export function runnerFor(pkg) {
+  const scripts = Object.values(pkg?.scripts ?? {}).join(' ');
+  const deps = { ...(pkg?.devDependencies ?? {}), ...(pkg?.dependencies ?? {}) };
+  if (/\bvitest\b/.test(scripts) || deps.vitest) return 'vitest';
+  if (/\bjest\b/.test(scripts) || deps.jest) return 'jest';
+  return null;
+}
+async function retryAlone(s, digest, text) {
+  if (flakyMode === 'off' || !flakyEligible(text, digest)) return null;
+  if (!lsFiles) lsFiles = gitOut(['ls-files', '*.test.*', '*.spec.*']).split('\n').filter(Boolean);
+  const pkgNames = new Set((digest.tasks ?? []).map((t) => t.split('#')[0]));
+  const groups = new Map();
+  for (const t of digest.tests) {
+    const hits = lsFiles.filter((f) => f === t || f.endsWith(`/${t}`));
+    const owned = hits.map((f) => {
+      let d = dirname(f);
+      while (d !== '.' && !existsSync(join(ROOT, d, 'package.json'))) d = dirname(d);
+      const pkg = readJson(join(ROOT, d, 'package.json')) || {};
+      return { f, d, pkg };
+    }).filter((h) => !pkgNames.size || pkgNames.has(h.pkg.name));
+    if (owned.length !== 1) return null;
+    const { f, d, pkg } = owned[0];
+    const runner = runnerFor(pkg);
+    if (!runner) return null;
+    const g = groups.get(d) ?? { runner, files: [], rel: [] };
+    g.files.push(f); g.rel.push(d === '.' ? f : f.slice(d.length + 1));
+    groups.set(d, g);
+  }
+  const st = Date.now();
+  const outcomes = [];
+  for (const [d, g] of groups) {
+    let bin = null;
+    for (let x = join(ROOT, d); ; x = dirname(x)) {
+      if (existsSync(join(x, 'node_modules', '.bin', g.runner))) { bin = join(x, 'node_modules', '.bin', g.runner); break; }
+      if (x === ROOT || x === dirname(x)) break;
+    }
+    if (!bin) return null;
+    const args = g.runner === 'vitest' ? ['run', ...g.rel, '--coverage.enabled=false'] : ['--runTestsByPath', ...g.rel, '--coverage=false', '--runInBand'];
+    console.log(`${C.d}      [flaky check] re-running ${g.rel.length} failing file(s) alone in ${d}: ${g.runner} ${args.join(' ')}${C.n}`);
+    const code = await new Promise((res) => {
+      const ch = spawn(bin, args, { cwd: join(ROOT, d), env: stepEnv(s.env), stdio: ['ignore', 'ignore', 'ignore'], detached: process.platform !== 'win32' });
+      const tm = setTimeout(() => killTree(ch, 'SIGKILL'), 5 * 60_000); tm.unref();
+      ch.on('error', () => { clearTimeout(tm); res(-1); });
+      ch.on('close', (c) => { clearTimeout(tm); res(c ?? -1); });
+    });
+    outcomes.push({ dir: d, files: g.files, code });
+  }
+  const passed = outcomes.length > 0 && outcomes.every((o) => o.code === 0);
+  const files = outcomes.flatMap((o) => o.files);
+  const seconds = +((Date.now() - st) / 1000).toFixed(1);
+  try {
+    mkdirSync(QUEUE_DIR, { recursive: true });
+    appendFileSync(join(QUEUE_DIR, 'flaky.jsonl'), JSON.stringify({
+      v: 1, at: new Date().toISOString(), repo: REPO, root: ROOT, sha: head || null, step: s.label,
+      files, passedAlone: passed, mode: flakyMode, verdict: passed ? (flakyMode === 'allow' ? 'let-through' : 'blocked-flaky') : 'real-failure', seconds,
+    }) + '\n');
+  } catch { /* bookkeeping only */ }
+  return { passed, files, seconds };
+}
+
+/** Keeps a red step's full output for 7 days, so a failure can be read after the terminal is gone. */
+const FAIL_LOG_DAYS = 7;
+function saveFailLog(label, text) {
+  try {
+    const dir = join(QUEUE_DIR, 'failed-output');
+    mkdirSync(dir, { recursive: true });
+    const cutoff = Date.now() - FAIL_LOG_DAYS * 864e5;
+    for (const f of readdirSync(dir)) {
+      try { if (statSync(join(dir, f)).mtimeMs < cutoff) rmSync(join(dir, f), { force: true }); } catch { /* raced */ }
+    }
+    const slug = label.replace(/[^\w.-]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'step';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = join(dir, `${REPO}-${ts}-${slug}.log`);
+    writeFileSync(file, String(text));
+    return file;
+  } catch { return null; /* bookkeeping never fails a gate */ }
 }
 
 const LASTFAIL_FILE = COMMON_DIR ? join(COMMON_DIR, 'local-ci-lastfail.json') : null;
@@ -1301,7 +1443,7 @@ async function runRelatedFirst(s) {
   if (!red) return false;
   printResult(s.label, `${C.r}FAIL${C.n} ${C.d}(related tests, ${secs(ms)}s; full step not run - LOCAL_CI_NO_RELATED=1 runs it)${C.n}`);
   failed.push(s.label);
-  results.set(s.label, { state: 'fail', seconds: +secs(ms), ms, ...digest });
+  results.set(s.label, { state: 'fail', seconds: +secs(ms), ms, ...digest, failLog: saveFailLog(`${s.label} (related)`, result.out) });
   setLastFailed(s.label, digest.tests);
   console.log(result.out.trimEnd().split('\n').slice(-25).map((l) => `      ${l}`).join('\n'));
   return true;
