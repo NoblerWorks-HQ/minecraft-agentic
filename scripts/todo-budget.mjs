@@ -879,9 +879,18 @@ function staged(root, cfg, today, file) {
   }
   const size = bytes(text);
   const headText = git(root, 'show', 'HEAD:TODO.md').stdout || '';
+  // A concurrent writer can truncate TODO.md mid-session (2026-11-10: engineering-standards went to 0 bytes and
+  // the commit deleted the whole list). Refuse a staged copy under a fifth of HEAD's; TODO_SHRINK_OK=1 overrides.
+  const headSize = bytes(headText);
+  if (headSize > 2000 && size < headSize * 0.2 && process.env.TODO_SHRINK_OK !== '1') {
+    console.error(`[todo-budget] REFUSED: staged TODO.md is ${fmt(size)} bytes, HEAD has ${fmt(headSize)}. Truncated by another writer? Restore with \`git checkout HEAD -- TODO.md\` and redo your edit; if the shrink is intended, commit with TODO_SHRINK_OK=1.`);
+    return 1;
+  }
   const old = new Set(headText.split('\n'));
   const fresh = text.split('\n').filter((l) => OPEN_RE.test(l) && !old.has(l) && bytes(l) > cfg.hardLine);
   for (const l of fresh) console.error(`[todo-budget] warn: a new open line is ${bytes(l)} bytes (soft cap ${cfg.softLine}): ${l.trim().slice(0, 90)}...`);
+  // Sessions merge into one file, so each can pass alone and the rebased sum still fail at push.
+  if (size <= cfg.ceiling && size > cfg.ceiling * 0.95) console.error(`[todo-budget] warn: TODO.md is ${fmt(size)} of ${fmt(cfg.ceiling)} bytes; close items soon or the next rebase can fail the gate.`);
   if (size <= cfg.ceiling) return 0;
   const archivePath = join(root, file);
   const archText = existsSync(archivePath) ? readFileSync(archivePath, 'utf8') : null;

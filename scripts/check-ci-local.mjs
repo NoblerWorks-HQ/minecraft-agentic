@@ -92,6 +92,10 @@
  *                     script itself is untouched - CI and deploys still run it
  *                     serially. 1 opts a repo out (a suite with a fixed port or a
  *                     shared container). See "two workers" below.
+ *   vitestWorkers     VITEST_MAX_WORKERS for every step (default: jestWorkers). Vitest
+ *                     otherwise starts one worker per core, so two gate slots ran ~20
+ *                     busy processes on 10 cores (2026-11-07). An exported
+ *                     VITEST_MAX_WORKERS wins. Turbo repos must pass it through.
  *   flaky             what a red test step does when its failing test files pass when re-run
  *                     alone: 'block' (default: still red, labelled likely flaky), 'allow' (the
  *                     step passes as "pass (flaky)"; Patrick's call per repo), 'off' (no re-run).
@@ -193,6 +197,7 @@ const inputsCfg   = cfg.inputs ?? {};
 const parallel    = cfg.parallel ?? (totalmem() >= 16 * 1024 ** 3);
 const minFreeMB   = cfg.minFreeMBPerStep ?? 2048;
 const jestWorkers = cfg.jestWorkers ?? (totalmem() >= 7 * 1024 ** 3 ? 2 : 1);
+const vitestWorkers = Math.max(1, cfg.vitestWorkers ?? jestWorkers);
 // Flaky catcher: a red test step re-runs ONLY its failing test files, alone, once. 'block' (default)
 // still fails the push but labels it "passed alone: likely flaky"; 'allow' lets it through as
 // "pass (flaky)" and records it; 'off' skips the re-run. Every outcome lands in flaky.jsonl.
@@ -220,6 +225,7 @@ function prepareStepTmp() {
 }
 const stepTmpOk = prepareStepTmp();
 const STEP_ENV = stepTmpOk ? { TMPDIR: STEP_TMPDIR, TMP: STEP_TMPDIR, TEMP: STEP_TMPDIR } : {};
+if (!process.env.VITEST_MAX_WORKERS) STEP_ENV.VITEST_MAX_WORKERS = String(vitestWorkers);
 // A push from a LINKED worktree runs this hook with an absolute GIT_DIR (and
 // friends) exported. A test doing `git -C <tmp> init/commit` then writes to the
 // real repo: on 2026-10-30 that set core.bare on nobler-starter-web-app and its
@@ -962,6 +968,22 @@ const BURST_SLOTS = Math.max(0, parseInt(process.env.LOCAL_CI_BURST_SLOTS ?? '1'
 const BURST_MAX_LOAD = Number(process.env.LOCAL_CI_BURST_MAX_LOAD) || cpus().length * 0.7;
 const BURST_MIN_FREE_MB = Number(process.env.LOCAL_CI_BURST_MIN_FREE_MB) || 8192;
 const burstOpen = () => BURST_SLOTS > 0 && loadavg()[0] < BURST_MAX_LOAD && freemem() / 1048576 >= BURST_MIN_FREE_MB;
+// ACTIVE CAP (2026-11-08, Patrick: "why are our gates so intense"). While Patrick is typing, only one
+// heavy job may START machine-wide; idle, the normal limit applies. Read from
+// engineering-standards' `train-triage.mjs slots` (train-triage.json "gateSlots"), at most every 30 s.
+// Missing script or unreadable answer: no cap (the queue behaves as before). LOCAL_CI_SLOTS pins the
+// limit and skips the cap. A gate that already holds a slot is never stopped.
+const TRIAGE_JS = process.env.LOCAL_CI_TRIAGE || join(homedir(), 'coding', 'engineering-standards', 'scripts', 'train-triage.mjs');
+let capAt = 0, capVal = null;
+function activeCap() {
+  if (process.env.LOCAL_CI_SLOTS || !existsSync(TRIAGE_JS)) return null;
+  if (Date.now() - capAt < 30000) return capVal;
+  capAt = Date.now();
+  const r = spawnSync(process.execPath, [TRIAGE_JS, 'slots'], { encoding: 'utf8', timeout: 10000 });
+  const m = /^(\d+) (.*)/.exec((r.stdout || '').trim());
+  capVal = r.status === 0 && m && +m[1] > 0 ? { n: +m[1], why: m[2] } : null;
+  return capVal;
+}
 const NO_QUEUE = process.env.LOCAL_CI_NO_QUEUE === '1' ? 'LOCAL_CI_NO_QUEUE=1'
   : process.env.LOCAL_CI_SLOT_HELD === '1' ? 'a gate running inside a gate that already holds a slot'
   : null;
@@ -1034,7 +1056,8 @@ async function acquireSlot() {
   const w0 = Date.now();
   let said = false, useFlock = true;
   for (;;) {
-    const limit = SLOTS + (burstOpen() ? BURST_SLOTS : 0);
+    const cap = activeCap();
+    const limit = Math.min(SLOTS + (burstOpen() ? BURST_SLOTS : 0), cap ? cap.n : Infinity); // a loop (FIRST_SLOT 2) waits while capped at 1
     for (let n = FIRST_SLOT; n <= limit && !slot; n++) {
       if (useFlock) {
         const r = await tryFlock(join(QUEUE_DIR, `slot-${n}.lock`));
@@ -1052,7 +1075,8 @@ async function acquireSlot() {
     if (!said) {
       said = true;
       console.log(`${C.y}  waiting for gate slot (held by ${holders()})${C.n}`);
-      console.log(`${C.d}  … ${SLOTS} gate(s) may run at once machine-wide (LOCAL_CI_SLOTS), ${SLOTS + BURST_SLOTS} while the machine is quiet; LOCAL_CI_NO_QUEUE=1 bypasses in an emergency${C.n}`);
+      const cap = activeCap();
+      console.log(`${C.d}  … ${SLOTS} gate(s) may run at once machine-wide (LOCAL_CI_SLOTS), ${SLOTS + BURST_SLOTS} while the machine is quiet${cap ? `; ${cap.n} may start now (${cap.why})` : ''}; LOCAL_CI_NO_QUEUE=1 bypasses in an emergency${C.n}`);
     }
     await sleep(2000);
   }
@@ -1078,6 +1102,8 @@ if (niceness > 0) {
     const cur = getPriority(0);
     if (cur < niceness) setPriority(0, niceness);
     appliedNice = getPriority(0);
+    // and the lowest IO class (2026-11-08); a no-op under the "none" scheduler WSL uses
+    spawnSync('ionice', ['-c3', '-p', String(process.pid)], { stdio: 'ignore', timeout: 5000 });
   } catch { /* never fail a gate over its priority */ }
 }
 const startLoad = +loadavg()[0].toFixed(2);
