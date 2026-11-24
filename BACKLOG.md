@@ -55,3 +55,11 @@
 - [ ] Consider a shareable/hosted-tunnel option (e.g. one-liner to expose the local viewer) - only if there's real demand; keeps the "100% local" promise by default.
 
 - [ ] Draft launch post (HN / Reddit r/Minecraft+r/programming / X) - the demo clip now exists.
+
+## Antigravity refactor audit (2026-11-23) - unverified
+
+> Gemini fleet audit, not checked item by item: a 2026-11-24 spot check of 7 claims found 1 false. Read the code before acting; figures were not re-measured. Detail: engineering-standards `docs/REFACTOR-AUDIT-2026-11-23.md`, section "minecraft-agentic".
+
+- [ ] [P1, L] 1,711L scripts/web.js monolith embedding a 567L HTML/CSS/JS control panel inside the HTTP server
+- [ ] [P2, M] 1,104L monolithic src/library/index.js containing all 13 procedural build presets
+- [ ] [P2, M] 2,641L duplicated fleet scripts and fragile caret-ranged postinstall monkey-patch of prismarine-viewer
