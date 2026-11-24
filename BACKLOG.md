@@ -63,3 +63,7 @@
 - [ ] [P1, L] 1,711L scripts/web.js monolith embedding a 567L HTML/CSS/JS control panel inside the HTTP server
 - [ ] [P2, M] 1,104L monolithic src/library/index.js containing all 13 procedural build presets
 - [ ] [P2, M] 2,641L duplicated fleet scripts and fragile caret-ranged postinstall monkey-patch of prismarine-viewer
+
+## Docs audit 2026-11-24
+
+- [ ] CLAUDE.md is 2,058 tokens vs the 2,000 budget (`engineering-standards/scripts/audit-claude-md.py`) after the audit's trims; move detail (e.g. the viewer-boot or ops bullets) to `docs/INVARIANTS.md` to get under.

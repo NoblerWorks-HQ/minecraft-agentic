@@ -15,7 +15,7 @@ Node.js (ESM); `mineflayer` + `mineflayer-pathfinder` + `prismarine-viewer`. AI 
 (Claude, Gemini, OpenAI, Ollama), auto-detected from the key set (override `LLM_PROVIDER`); no key -> `src/library/` presets.
 
 ## Safety Guardrails
-- NEVER commit `.env` or the Anthropic API key (only `.env.example` belongs in git); ALWAYS keep `ANTHROPIC_API_KEY` in `.env` (gitignored).
+- NEVER commit `.env` or any provider API key; keys live in `.env` (gitignored), only `.env.example` belongs in git.
 - NEVER point the bots at a production / online-mode server.
 - ALWAYS be mindful of token spend in `crew` mode (4 bots = more model calls; `CRITIC=on` adds vision calls).
 
@@ -49,7 +49,7 @@ Node.js (ESM); `mineflayer` + `mineflayer-pathfinder` + `prismarine-viewer`. AI 
 - **prismarine-viewer also DELETES a chunk's meshes the instant it slides out of the camera's radius - this project patches that too.**
 - **The crew builds in PARALLEL (role i starts at i*3000ms, ~10 blocks/s), so "a later role overwrites an earlier role's block" is a RACE, not a technique - and the earlier role usually wins.**
 - **`npm run e2e` (single bot) or `npm run replay` (full crew, cached plan) verify the whole path against a live server with NO API key** - run one after changing bot connection, block placement, or the viewer.
-- **`npm test` (`test/pick-ground.test.mjs`) covers click-to-place, the one feature on prismarine-viewer's internals** - run it after touching the viewer proxy or the page.
+- **`test/pick-ground.test.mjs` (in `npm test`) covers click-to-place, the one feature on prismarine-viewer's internals** - run it after touching the viewer proxy or the page.
 
 Viewer and panel boot (`src/viewer.js`, `src/viewer-hook.js`, `scripts/web.js`):
 - **The viewer never throws**: the `prismarine-viewer` import is dynamic and try/caught (a broken native `canvas` degrades to "watch in-game"); `canvas` stays an `optionalDependency` - `npm install` must never hard-fail on it. `scripts/web.js` reverse-proxies it so the panel is ONE url (`:8080`).
